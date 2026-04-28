@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,7 +31,7 @@ def is_scg_file(path: Path) -> bool:
     name = path.name
     if name in SCG_CANDIDATE_NAMES:
         return True
-    # include legacy named files like 054（1）.csv / 055（6分钟）.csv
+    # Include legacy names like 054（1）.csv / 055（6分钟）.csv
     if "（" in name and "）" in name and name.lower().endswith(".csv"):
         return True
     return False
@@ -84,5 +84,5 @@ def read_scg_window(path: Path, start_row: int, end_row: int, mode: str) -> pd.D
         keep = [c for c in cols if c != "I0"][-6:]
 
     out = df[keep].apply(pd.to_numeric, errors="coerce")
-    out = out.fillna(method="ffill").fillna(method="bfill").fillna(0.0)
+    out = out.ffill().bfill().fillna(0.0)
     return out

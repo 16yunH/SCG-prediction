@@ -18,16 +18,36 @@ from .models import ModelConfig, build_model
 from .utils import ensure_dir, now_tag, save_json, set_seed
 
 
+def normalize_gpu_ids(raw: Any) -> list[int]:
+    if raw is None:
+        return []
+    if isinstance(raw, int):
+        return [raw]
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        return [int(x.strip()) for x in text.split(",") if x.strip()]
+    if isinstance(raw, list):
+        return [int(x) for x in raw]
+    return []
+
+
 class ScgDataset(Dataset):
-    def __init__(self, sample_df: pd.DataFrame, input_channels: int, window_size: int) -> None:
+    def __init__(self, sample_df: pd.DataFrame, input_channels: int, window_size: int, cache_windows: bool = True) -> None:
         self.df = sample_df.reset_index(drop=True)
         self.input_channels = input_channels
         self.window_size = window_size
+        self.cache_windows = cache_windows
+        self.x_cache: list[torch.Tensor] | None = None
+        self.y_cache: list[torch.Tensor] | None = None
+        if self.cache_windows:
+            self._build_cache()
 
     def __len__(self) -> int:
         return len(self.df)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _row_to_xy(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         row = self.df.iloc[idx]
         path = Path(row["scg_file"])
         mode = str(row["scg_mode"])
@@ -53,6 +73,19 @@ class ScgDataset(Dataset):
         y = torch.tensor([float(row["SBP"]), float(row["DBP"])], dtype=torch.float32)
         return x, y
 
+    def _build_cache(self) -> None:
+        self.x_cache = []
+        self.y_cache = []
+        for idx in range(len(self.df)):
+            x, y = self._row_to_xy(idx)
+            self.x_cache.append(x)
+            self.y_cache.append(y)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.x_cache is not None and self.y_cache is not None:
+            return self.x_cache[idx], self.y_cache[idx]
+        return self._row_to_xy(idx)
+
 
 def mae_per_target(pred: torch.Tensor, target: torch.Tensor) -> tuple[float, float]:
     e = torch.abs(pred - target)
@@ -71,8 +104,8 @@ def run_epoch(model: nn.Module, loader: DataLoader, device: torch.device, optimi
     dbps: list[float] = []
 
     for x, y in loader:
-        x = x.to(device)
-        y = y.to(device)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
 
         with torch.set_grad_enabled(train_mode):
             pred = model(x)
@@ -94,11 +127,29 @@ def run_epoch(model: nn.Module, loader: DataLoader, device: torch.device, optimi
     }
 
 
-def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, batch_size: int, workers: int, channels: int, window_size: int) -> tuple[DataLoader, DataLoader]:
-    train_ds = ScgDataset(train_df, channels, window_size)
-    val_ds = ScgDataset(val_df, channels, window_size)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=workers)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=workers)
+def build_loaders(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    batch_size: int,
+    workers: int,
+    channels: int,
+    window_size: int,
+    pin_memory: bool,
+    cache_windows: bool,
+) -> tuple[DataLoader, DataLoader]:
+    train_ds = ScgDataset(train_df, channels, window_size, cache_windows=cache_windows)
+    val_ds = ScgDataset(val_df, channels, window_size, cache_windows=cache_windows)
+
+    loader_kwargs: dict[str, Any] = {
+        "batch_size": batch_size,
+        "num_workers": workers,
+        "pin_memory": pin_memory,
+    }
+    if workers > 0:
+        loader_kwargs["persistent_workers"] = True
+
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
     return train_loader, val_loader
 
 
@@ -110,7 +161,15 @@ def fit_one_fold(
     cfg: dict[str, Any],
     device: torch.device,
 ) -> dict[str, Any]:
+    runtime_cfg = cfg["runtime"]
     model = build_model(model_name, model_cfg).to(device)
+    gpu_ids = normalize_gpu_ids(runtime_cfg.get("gpu_ids", []))
+    if (
+        device.type == "cuda"
+        and bool(runtime_cfg.get("use_data_parallel", False))
+        and len(gpu_ids) > 1
+    ):
+        model = nn.DataParallel(model, device_ids=gpu_ids)
     opt_cfg = cfg["optimization"]
 
     optimizer = torch.optim.AdamW(
@@ -123,9 +182,11 @@ def fit_one_fold(
         train_df=train_df,
         val_df=val_df,
         batch_size=int(opt_cfg["batch_size"]),
-        workers=int(cfg["runtime"]["num_workers"]),
+        workers=int(runtime_cfg["num_workers"]),
         channels=model_cfg.input_channels,
         window_size=model_cfg.window_size,
+        pin_memory=bool(runtime_cfg.get("pin_memory", True)),
+        cache_windows=bool(runtime_cfg.get("cache_windows", True)),
     )
 
     best_val = float("inf")
@@ -134,20 +195,40 @@ def fit_one_fold(
     bad = 0
 
     history: list[dict[str, float]] = []
+    print(
+        f"[fold] model={model_name} train={len(train_df)} val={len(val_df)} "
+        f"batch={int(opt_cfg['batch_size'])} epochs={int(opt_cfg['epochs'])}",
+        flush=True,
+    )
     for epoch in range(1, int(opt_cfg["epochs"]) + 1):
         tr = run_epoch(model, train_loader, device, optimizer)
         va = run_epoch(model, val_loader, device, optimizer=None)
         row = {"epoch": epoch, **{f"train_{k}": v for k, v in tr.items()}, **{f"val_{k}": v for k, v in va.items()}}
         history.append(row)
+        print(
+            "[epoch {ep:03d}] train_loss={tl:.4f} train_mae=({ts:.3f},{td:.3f}) "
+            "val_loss={vl:.4f} val_mae=({vs:.3f},{vd:.3f})".format(
+                ep=epoch,
+                tl=tr["loss"],
+                ts=tr["mae_sbp"],
+                td=tr["mae_dbp"],
+                vl=va["loss"],
+                vs=va["mae_sbp"],
+                vd=va["mae_dbp"],
+            ),
+            flush=True,
+        )
 
         score = va["mae_sbp"] + va["mae_dbp"]
         if score < best_val:
             best_val = score
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             bad = 0
+            print(f"[epoch {epoch:03d}] new best score={score:.4f}", flush=True)
         else:
             bad += 1
             if bad >= patience:
+                print(f"[early-stop] epoch={epoch} patience={patience}", flush=True)
                 break
 
     if best_state is not None:
@@ -158,23 +239,35 @@ def fit_one_fold(
 
 
 def evaluate_model(model: nn.Module, df: pd.DataFrame, cfg: dict[str, Any], model_cfg: ModelConfig, device: torch.device) -> dict[str, float]:
+    runtime_cfg = cfg["runtime"]
     loader = DataLoader(
-        ScgDataset(df, model_cfg.input_channels, model_cfg.window_size),
+        ScgDataset(df, model_cfg.input_channels, model_cfg.window_size, cache_windows=bool(runtime_cfg.get("cache_windows", True))),
         batch_size=int(cfg["optimization"]["batch_size"]),
         shuffle=False,
-        num_workers=int(cfg["runtime"]["num_workers"]),
+        num_workers=int(runtime_cfg["num_workers"]),
+        pin_memory=bool(runtime_cfg.get("pin_memory", True)),
     )
     return run_epoch(model, loader, device, optimizer=None)
 
 
 def run(model_name: str, config_path: str, overrides: list[str] | None = None) -> None:
     cfg = load_with_overrides(config_path, overrides)
-    set_seed(int(cfg["runtime"]["seed"]))
+    runtime_cfg = cfg["runtime"]
+    set_seed(int(runtime_cfg["seed"]))
+    gpu_ids = normalize_gpu_ids(runtime_cfg.get("gpu_ids", []))
 
-    device_name = cfg["runtime"].get("device", "cuda")
+    device_name = runtime_cfg.get("device", "cuda")
     if device_name == "cuda" and not torch.cuda.is_available():
         device_name = "cpu"
-    device = torch.device(device_name)
+    if device_name == "cuda":
+        if gpu_ids:
+            primary = gpu_ids[0]
+            torch.cuda.set_device(primary)
+            device = torch.device(f"cuda:{primary}")
+        else:
+            device = torch.device("cuda")
+    else:
+        device = torch.device(device_name)
 
     split_dir = Path(cfg["input"]["split_dir"])
     trainval = pd.read_csv(split_dir / "trainval.csv")
@@ -193,10 +286,18 @@ def run(model_name: str, config_path: str, overrides: list[str] | None = None) -
     )
 
     run_dir = ensure_dir(Path(cfg["output"]["runs_dir"]) / f"{now_tag()}_{model_name}")
+    print(
+        f"[start] model={model_name} device={device} cuda_available={torch.cuda.is_available()} "
+        f"cuda_count={torch.cuda.device_count()} gpu_ids={gpu_ids} "
+        f"data_parallel={runtime_cfg.get('use_data_parallel', False)} "
+        f"trainval={len(trainval)} test={len(test_df)} run_dir={run_dir}",
+        flush=True,
+    )
     fold_metrics = []
 
     unique_folds = sorted(folds["fold"].unique().tolist())
     for fold in unique_folds:
+        print(f"[cv] fold={fold}/{len(unique_folds)}", flush=True)
         fold_map = folds[folds["fold"] == fold][["sample_id", "subset"]]
         merged = trainval.merge(fold_map, on="sample_id", how="inner")
         tr_df = merged[merged["subset"] == "train"].drop(columns=["subset"])
@@ -220,10 +321,21 @@ def run(model_name: str, config_path: str, overrides: list[str] | None = None) -
                 writer = csv.DictWriter(f, fieldnames=list(result["history"][0].keys()))
                 writer.writeheader()
                 writer.writerows(result["history"])
+        print(
+            f"[cv] fold={fold} best_val_mae=({fold_metrics[-1]['val_mae_sbp']:.3f},{fold_metrics[-1]['val_mae_dbp']:.3f})",
+            flush=True,
+        )
 
     # Final model on full trainval, validated on holdout test for report.
+    print("[final] training on trainval and selecting by holdout metric pass", flush=True)
     final_result = fit_one_fold(model_name, model_cfg, trainval, test_df, cfg, device)
     final_model = build_model(model_name, model_cfg).to(device)
+    if (
+        device.type == "cuda"
+        and bool(runtime_cfg.get("use_data_parallel", False))
+        and len(gpu_ids) > 1
+    ):
+        final_model = nn.DataParallel(final_model, device_ids=gpu_ids)
     final_model.load_state_dict(final_result["state_dict"])
     test_metrics = evaluate_model(final_model, test_df, cfg, model_cfg, device)
 
@@ -245,7 +357,7 @@ def run(model_name: str, config_path: str, overrides: list[str] | None = None) -
     pd.DataFrame(fold_metrics).to_csv(run_dir / "fold_metrics.csv", index=False)
     save_json(run_dir / "metrics.json", summary)
 
-    print(summary)
+    print(f"[done] {summary}", flush=True)
 
 
 def main() -> None:

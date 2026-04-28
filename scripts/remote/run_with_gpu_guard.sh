@@ -60,7 +60,7 @@ pick_gpu() {
     fi
 
     local mem_pct=$(( mem_used * 100 / mem_total ))
-    echo "[$(date '+%F %T')] GPU=$idx util=${util}% mem=${mem_used}/${mem_total}MB (${mem_pct}%)" | tee -a "$LOG_FILE"
+    echo "[$(date '+%F %T')] GPU=$idx util=${util}% mem=${mem_used}/${mem_total}MB (${mem_pct}%)" | tee -a "$LOG_FILE" >&2
 
     if [[ "$util" -lt "$GPU_UTIL_THRESHOLD" && "$mem_pct" -lt "$GPU_MEM_THRESHOLD" ]]; then
       picked="$idx"
@@ -92,7 +92,8 @@ done
 
 echo "[$(date '+%F %T')] Selected GPU=$SELECTED_GPU" | tee -a "$LOG_FILE"
 
-TMUX_CMD="export CUDA_VISIBLE_DEVICES=${SELECTED_GPU}; ${RUN_COMMAND} 2>&1 | tee -a ${LOG_FILE}"
+# Unbuffered Python output and line-buffered pipes for live tmux visibility.
+TMUX_CMD="export CUDA_VISIBLE_DEVICES=${SELECTED_GPU}; export PYTHONUNBUFFERED=1; stdbuf -oL -eL bash -lc '${RUN_COMMAND}' 2>&1 | tee -a ${LOG_FILE}"
 
 # Replace existing session if present.
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
