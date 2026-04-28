@@ -1,0 +1,27 @@
+paths:
+  # local default; override on server with --override or by editing config
+  data_root: ./data
+  artifacts_root: ./artifacts
+  processed_dir: ./artifacts/processed
+  runs_dir: ./artifacts/runs
+
+bp:
+  required_columns: [SBP, DBP]
+  optional_columns: [HR, PP]
+  strict: false
+
+scg:
+  preferred_axes_7col: [I1, I2, I3, I4, I5, I6]
+  preferred_axes_9col: [I3, I4, I5, I6, I7, I8]
+  sample_rate_hz: 50
+
+window:
+  seconds: 8
+  stride_seconds: 2
+  # Center each BP timestamp and take a nearest signal window.
+  strategy: centered_single_window
+
+output:
+  bp_index: ./artifacts/processed/bp_index.csv
+  signal_index: ./artifacts/processed/signal_index.csv
+  sample_index: ./artifacts/processed/sample_index.csv

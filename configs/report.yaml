@@ -1,0 +1,7 @@
+input:
+  metrics_summary: ./artifacts/metrics/metrics_summary.csv
+  fold_metrics: ./artifacts/metrics/fold_metrics.csv
+
+output:
+  figure_dir: ./artifacts/figures
+  report_md: ./artifacts/report.md
