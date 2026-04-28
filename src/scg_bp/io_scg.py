@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 
 
@@ -86,3 +87,21 @@ def read_scg_window(path: Path, start_row: int, end_row: int, mode: str) -> pd.D
     out = df[keep].apply(pd.to_numeric, errors="coerce")
     out = out.ffill().bfill().fillna(0.0)
     return out
+
+
+def read_scg_full_array(path: Path, mode: str, input_channels: int) -> np.ndarray:
+    """Read one SCG csv once and return normalized channels-ready full array [T, C]."""
+    df = pd.read_csv(path)
+    cols = list(df.columns)
+    if mode == "9col":
+        keep = [c for c in ["I3", "I4", "I5", "I6", "I7", "I8"] if c in cols]
+    else:
+        keep = [c for c in ["I1", "I2", "I3", "I4", "I5", "I6"] if c in cols]
+    if len(keep) < input_channels:
+        keep = [c for c in cols if c != "I0"][-max(input_channels, 1) :]
+    out = df[keep].apply(pd.to_numeric, errors="coerce").ffill().bfill().fillna(0.0)
+    arr = out.to_numpy(dtype=np.float32, copy=False)
+    if arr.shape[1] < input_channels:
+        pad = np.zeros((arr.shape[0], input_channels - arr.shape[1]), dtype=np.float32)
+        arr = np.concatenate([arr, pad], axis=1)
+    return arr[:, :input_channels]

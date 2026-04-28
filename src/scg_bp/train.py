@@ -13,7 +13,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from .config import load_with_overrides
-from .io_scg import read_scg_window
+from .io_scg import read_scg_full_array, read_scg_window
 from .models import ModelConfig, build_model
 from .utils import ensure_dir, now_tag, save_json, set_seed
 
@@ -76,8 +76,31 @@ class ScgDataset(Dataset):
     def _build_cache(self) -> None:
         self.x_cache = []
         self.y_cache = []
+        file_cache: dict[tuple[str, str], np.ndarray] = {}
         for idx in range(len(self.df)):
-            x, y = self._row_to_xy(idx)
+            row = self.df.iloc[idx]
+            key = (str(row["scg_file"]), str(row["scg_mode"]))
+            if key not in file_cache:
+                file_cache[key] = read_scg_full_array(Path(key[0]), key[1], self.input_channels)
+
+            full = file_cache[key]
+            start_row = int(row["start_row"])
+            end_row = int(row["end_row"])
+            start_row = max(0, min(start_row, max(0, full.shape[0] - 1)))
+            end_row = max(start_row + 1, min(end_row, full.shape[0]))
+            arr = full[start_row:end_row]
+
+            if arr.shape[0] < self.window_size:
+                pad = np.zeros((self.window_size - arr.shape[0], arr.shape[1]), dtype=np.float32)
+                arr = np.concatenate([arr, pad], axis=0)
+            arr = arr[: self.window_size, :]
+
+            mean = arr.mean(axis=0, keepdims=True)
+            std = arr.std(axis=0, keepdims=True) + 1e-6
+            arr = (arr - mean) / std
+
+            x = torch.from_numpy(arr.T)
+            y = torch.tensor([float(row["SBP"]), float(row["DBP"])], dtype=torch.float32)
             self.x_cache.append(x)
             self.y_cache.append(y)
 
