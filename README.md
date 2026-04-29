@@ -68,6 +68,49 @@ python -m src.train --model full --config configs/train.yaml --mode final
 
 Training reads `window_index.csv + arrays/*.npy` through split files. It only falls back to raw CSV reads for debugging or legacy indices.
 
+## Baselines And Calibrated Protocol
+
+Run non-neural baselines on an existing split:
+
+```bash
+python -m src.baselines --config configs/baseline.yaml \
+  --override input.split_dir=./artifacts/processed/v2/splits \
+  --override output.runs_dir=./artifacts/runs_baselines
+```
+
+Create a subject-dependent calibrated split. This keeps all subjects in both
+train/test but splits by BP label group, so the three jitter windows from one BP
+measurement cannot leak across subsets:
+
+```bash
+python -m src.make_calibrated_splits --config configs/calibrated_split.yaml \
+  --override input.sample_index=./artifacts/processed/v2/window_index.csv \
+  --override output.split_dir=./artifacts/processed/v2/calibrated_splits
+```
+
+Train on the calibrated split:
+
+```bash
+python -m src.train --model cnn_only --config configs/train.yaml \
+  --override input.split_dir=./artifacts/processed/v2/calibrated_splits \
+  --override optimization.allow_subject_overlap_validation=true
+```
+
+Use 5-fold CV checkpoint ensembling for the calibrated test set. This avoids
+depending on a single final validation fold:
+
+```bash
+python -m src.train --model cnn_only --config configs/train.yaml \
+  --override input.split_dir=./artifacts/processed/v2/calibrated_splits \
+  --override optimization.allow_subject_overlap_validation=true \
+  --override optimization.test_strategy=cv_ensemble \
+  --override model.dropout=0.1
+```
+
+Interpretation: subject-independent results estimate no-calibration performance
+on unseen people; calibrated results estimate within-subject performance after
+some BP labels from the same people are available.
+
 ## Remote 8-GPU Ablation Matrix
 
 Use the queue launcher to run model/fold jobs across available GPUs with live tmux output and persistent logs:
@@ -115,6 +158,7 @@ python -m src.report --config configs/report.yaml \
 ## Notes
 
 - Legacy `.xls` requires `python-calamine` or `xlrd`; `python-calamine` is preferred.
-- Splits are subject-level to avoid leakage.
+- Default splits are subject-level to avoid leakage.
+- Calibrated splits are subject-dependent but still isolate BP label groups to avoid jitter-window leakage.
 - Default alignment is `rank_interpolation` because exact BP-SCG timestamps are not consistently available.
 - The current dataset is suitable for project-level ablation comparison, not clinical-grade generalization claims.

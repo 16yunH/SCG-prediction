@@ -1,0 +1,15 @@
+input:
+  split_dir: ./artifacts/processed/v2/splits
+
+features:
+  input_channels: 6
+  window_size: 400
+  include_hr: false
+  include_window_meta: true
+
+ridge:
+  alphas: [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+  final_validation_fold: 1
+
+output:
+  runs_dir: ./artifacts/runs

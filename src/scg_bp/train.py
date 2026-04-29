@@ -320,6 +320,79 @@ def evaluate_model(
     return run_epoch(model, loader, device, optimizer=None, target_stats=target_stats)
 
 
+def predict_raw_model(
+    model: nn.Module,
+    df: pd.DataFrame,
+    cfg: dict[str, Any],
+    model_cfg: ModelConfig,
+    device: torch.device,
+    target_stats: dict[str, list[float]],
+) -> np.ndarray:
+    runtime_cfg = cfg["runtime"]
+    loader = DataLoader(
+        ScgDataset(
+            df,
+            model_cfg.input_channels,
+            model_cfg.window_size,
+            cache_windows=bool(runtime_cfg.get("cache_windows", True)),
+            mmap_arrays=bool(runtime_cfg.get("mmap_arrays", True)),
+            allow_csv_fallback=bool(runtime_cfg.get("allow_csv_fallback", False)),
+            target_stats=target_stats,
+        ),
+        batch_size=int(cfg["optimization"]["batch_size"]),
+        shuffle=False,
+        num_workers=int(runtime_cfg["num_workers"]),
+        pin_memory=bool(runtime_cfg.get("pin_memory", True)),
+    )
+    target_mean, target_std = _target_tensors(target_stats, device)
+    model.eval()
+    preds: list[np.ndarray] = []
+    with torch.no_grad():
+        for x, _ in loader:
+            x = x.to(device, non_blocking=True)
+            pred = model(x) * target_std + target_mean
+            preds.append(pred.detach().cpu().numpy())
+    return np.concatenate(preds, axis=0) if preds else np.zeros((0, 2), dtype=np.float32)
+
+
+def _mae_np(pred: np.ndarray, df: pd.DataFrame) -> dict[str, float]:
+    y = df[["SBP", "DBP"]].to_numpy(dtype=np.float32)
+    err = np.abs(pred - y)
+    return {
+        "mae_sbp": float(err[:, 0].mean()) if len(err) else float("nan"),
+        "mae_dbp": float(err[:, 1].mean()) if len(err) else float("nan"),
+        "loss": float(err.mean()) if len(err) else float("nan"),
+    }
+
+
+def _prediction_frame(df: pd.DataFrame, pred: np.ndarray) -> pd.DataFrame:
+    out = df[["sample_id", "subject_id", "SBP", "DBP"]].copy()
+    out["pred_SBP"] = pred[:, 0]
+    out["pred_DBP"] = pred[:, 1]
+    out["abs_err_SBP"] = np.abs(out["pred_SBP"] - out["SBP"].astype(float))
+    out["abs_err_DBP"] = np.abs(out["pred_DBP"] - out["DBP"].astype(float))
+    return out
+
+
+def _subject_error_frame(pred_df: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for subject, g in pred_df.groupby("subject_id", sort=True):
+        rows.append(
+            {
+                "subject_id": subject,
+                "n": int(len(g)),
+                "mae_sbp": float(g["abs_err_SBP"].mean()),
+                "mae_dbp": float(g["abs_err_DBP"].mean()),
+                "mae_mean": float((g["abs_err_SBP"].mean() + g["abs_err_DBP"].mean()) / 2),
+                "true_sbp_mean": float(g["SBP"].mean()),
+                "true_dbp_mean": float(g["DBP"].mean()),
+                "pred_sbp_mean": float(g["pred_SBP"].mean()),
+                "pred_dbp_mean": float(g["pred_DBP"].mean()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _device_from_cfg(runtime_cfg: dict[str, Any]) -> torch.device:
     device_name = runtime_cfg.get("device", "cuda")
     if device_name == "cuda" and not torch.cuda.is_available():
@@ -372,6 +445,43 @@ def _final_train_val_split(trainval: pd.DataFrame, folds: pd.DataFrame, validati
     return tr_df, va_df
 
 
+def _assert_no_label_group_leakage(train_df: pd.DataFrame, val_df: pd.DataFrame, context: str) -> None:
+    if "label_group_id" not in train_df.columns or "label_group_id" not in val_df.columns:
+        return
+    overlap = set(train_df["label_group_id"].astype(str)) & set(val_df["label_group_id"].astype(str))
+    if overlap:
+        raise RuntimeError(f"Label-group leakage in {context}: {sorted(overlap)[:5]}")
+
+
+def _final_train_val_split_for_cfg(
+    trainval: pd.DataFrame,
+    folds: pd.DataFrame,
+    validation_fold: int,
+    allow_subject_overlap: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    tr_df, va_df = _final_train_val_split_no_subject_check(trainval, folds, validation_fold)
+    _assert_no_label_group_leakage(tr_df, va_df, f"final validation fold {validation_fold}")
+    if not allow_subject_overlap:
+        tr_subjects = set(tr_df["subject_id"].astype(str))
+        va_subjects = set(va_df["subject_id"].astype(str))
+        overlap = tr_subjects & va_subjects
+        if overlap:
+            raise RuntimeError(f"Subject leakage in final validation fold {validation_fold}: {sorted(overlap)}")
+    return tr_df, va_df
+
+
+def _final_train_val_split_no_subject_check(trainval: pd.DataFrame, folds: pd.DataFrame, validation_fold: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    fold_map = folds[folds["fold"] == validation_fold][["sample_id", "subset"]]
+    if fold_map.empty:
+        raise ValueError(f"final_validation_fold={validation_fold} not found in folds.csv")
+    merged = trainval.merge(fold_map, on="sample_id", how="inner")
+    tr_df = merged[merged["subset"] == "train"].drop(columns=["subset"])
+    va_df = merged[merged["subset"] == "val"].drop(columns=["subset"])
+    if tr_df.empty or va_df.empty:
+        raise RuntimeError(f"Invalid final validation fold {validation_fold}: train={len(tr_df)} val={len(va_df)}")
+    return tr_df, va_df
+
+
 def run(model_name: str, config_path: str, overrides: list[str] | None = None, fold_filter: int | None = None, mode: str = "all") -> None:
     cfg = load_with_overrides(config_path, overrides)
     runtime_cfg = cfg["runtime"]
@@ -396,6 +506,7 @@ def run(model_name: str, config_path: str, overrides: list[str] | None = None, f
 
     start_time = time.time()
     fold_metrics: list[dict[str, Any]] = []
+    cv_states: list[dict[str, Any]] = []
     if mode in {"all", "cv"}:
         unique_folds = sorted(int(x) for x in folds["fold"].unique().tolist())
         if fold_filter is not None:
@@ -406,9 +517,11 @@ def run(model_name: str, config_path: str, overrides: list[str] | None = None, f
             merged = trainval.merge(fold_map, on="sample_id", how="inner")
             tr_df = merged[merged["subset"] == "train"].drop(columns=["subset"])
             va_df = merged[merged["subset"] == "val"].drop(columns=["subset"])
+            _assert_no_label_group_leakage(tr_df, va_df, f"cv fold {fold}")
             result = fit_one_fold(model_name, model_cfg, tr_df, va_df, cfg, device)
             best = result["best"]
             fold_metrics.append({"model": model_name, "fold": int(fold), "val_mae_sbp": float(best["val_mae_sbp"]), "val_mae_dbp": float(best["val_mae_dbp"]), "val_loss": float(best["val_loss"]), "run_dir": str(run_dir)})
+            cv_states.append({"fold": int(fold), "state_dict": result["state_dict"], "target_stats": result["target_stats"]})
             fold_dir = ensure_dir(run_dir / f"fold_{int(fold)}")
             _write_history(fold_dir / "metrics.csv", result["history"])
             torch.save(result["state_dict"], fold_dir / "best.pt")
@@ -417,9 +530,38 @@ def run(model_name: str, config_path: str, overrides: list[str] | None = None, f
 
     test_metrics: dict[str, float] = {"mae_sbp": float("nan"), "mae_dbp": float("nan"), "loss": float("nan")}
     final_validation_fold = int(cfg["optimization"].get("final_validation_fold", 1))
+    test_strategy = str(cfg["optimization"].get("test_strategy", "final"))
+    ensemble_test_metrics: dict[str, float] | None = None
+    if mode == "all" and fold_filter is None and test_strategy in {"cv_ensemble", "both"} and cv_states:
+        fold_preds: list[np.ndarray] = []
+        for item in cv_states:
+            fold_model = build_model(model_name, model_cfg).to(device)
+            fold_model.load_state_dict(item["state_dict"])
+            fold_preds.append(predict_raw_model(fold_model, test_df, cfg, model_cfg, device, item["target_stats"]))
+        ensemble_pred = np.mean(np.stack(fold_preds, axis=0), axis=0)
+        ensemble_test_metrics = _mae_np(ensemble_pred, test_df)
+        pred_df = _prediction_frame(test_df, ensemble_pred)
+        pred_df.to_csv(run_dir / "cv_ensemble_test_predictions.csv", index=False)
+        _subject_error_frame(pred_df).to_csv(run_dir / "cv_ensemble_subject_errors.csv", index=False)
+        print(
+            "[cv-ensemble] test_mae=({sbp:.3f},{dbp:.3f}) folds={folds}".format(
+                sbp=ensemble_test_metrics["mae_sbp"],
+                dbp=ensemble_test_metrics["mae_dbp"],
+                folds=len(cv_states),
+            ),
+            flush=True,
+        )
+        if test_strategy == "cv_ensemble":
+            test_metrics = ensemble_test_metrics
+
     final_target_stats: dict[str, list[float]] | None = None
-    if mode in {"all", "final"} and fold_filter is None:
-        final_train, final_val = _final_train_val_split(trainval, folds, final_validation_fold)
+    if mode in {"all", "final"} and fold_filter is None and test_strategy != "cv_ensemble":
+        final_train, final_val = _final_train_val_split_for_cfg(
+            trainval,
+            folds,
+            final_validation_fold,
+            allow_subject_overlap=bool(cfg["optimization"].get("allow_subject_overlap_validation", False)),
+        )
         print(
             f"[final] training with internal validation fold={final_validation_fold} "
             f"train={len(final_train)} val={len(final_val)} test={len(test_df)}",
@@ -452,6 +594,9 @@ def run(model_name: str, config_path: str, overrides: list[str] | None = None, f
         "runtime_seconds": float(time.time() - start_time),
         "target_standardize": bool(cfg["optimization"].get("target_standardize", True)),
         "final_validation_fold": final_validation_fold if mode in {"all", "final"} and fold_filter is None else None,
+        "test_strategy": test_strategy,
+        "ensemble_test_mae_sbp": float(ensemble_test_metrics["mae_sbp"]) if ensemble_test_metrics else float("nan"),
+        "ensemble_test_mae_dbp": float(ensemble_test_metrics["mae_dbp"]) if ensemble_test_metrics else float("nan"),
         "final_target_stats": final_target_stats,
         "model_config": asdict(model_cfg),
     }

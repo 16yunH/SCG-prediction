@@ -1,0 +1,11 @@
+input:
+  sample_index: ./artifacts/processed/v2/window_index.csv
+
+split:
+  test_size: 0.2
+  random_seed: 42
+  group_kfold: 5
+  min_groups_per_subject: 3
+
+output:
+  split_dir: ./artifacts/processed/v2/calibrated_splits

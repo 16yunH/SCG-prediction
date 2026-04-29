@@ -20,6 +20,8 @@ optimization:
   early_stop_patience: 30
   target_standardize: true
   final_validation_fold: 1
+  allow_subject_overlap_validation: false
+  test_strategy: final
 
 model:
   input_channels: 6

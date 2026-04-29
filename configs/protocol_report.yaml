@@ -1,0 +1,12 @@
+input:
+  subject_independent_summary: ./artifacts/local_full_combined_report/ablation_summary.csv
+  calibrated_summary: ./artifacts/local_calibrated_combined_report/ablation_summary.csv
+  optimized_summary: ./artifacts/local_optimized_summary/optimized_summary.csv
+  seed_metrics: ./artifacts/local_calibrated_seed_stability/seed_metrics.csv
+  seed_summary: ./artifacts/local_calibrated_seed_stability/seed_summary.csv
+  subject_error_summary: ./artifacts/local_calibrated_seed_stability/subject_error_summary.csv
+
+output:
+  report_md: ./artifacts/final_protocol_report/protocol_report.md
+  summary_csv: ./artifacts/final_protocol_report/protocol_summary.csv
+  figure_dir: ./artifacts/final_protocol_report/figures
