@@ -5,3 +5,5 @@ input:
 output:
   figure_dir: ./artifacts/figures
   report_md: ./artifacts/report.md
+  summary_csv: ./artifacts/ablation_summary.csv
+  summary_xlsx: ./artifacts/ablation_summary.xlsx

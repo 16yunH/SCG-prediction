@@ -1,8 +1,8 @@
 paths:
-  # local default; override on server with --override or by editing config
   data_root: ./data
   artifacts_root: ./artifacts
-  processed_dir: ./artifacts/processed
+  processed_dir: ./artifacts/processed/v2
+  arrays_dir: ./artifacts/processed/v2/arrays
   runs_dir: ./artifacts/runs
 
 bp:
@@ -14,14 +14,19 @@ scg:
   preferred_axes_7col: [I1, I2, I3, I4, I5, I6]
   preferred_axes_9col: [I3, I4, I5, I6, I7, I8]
   sample_rate_hz: 50
+  input_channels: 6
+  materialize_arrays: true
 
 window:
   seconds: 8
   stride_seconds: 2
-  # Center each BP timestamp and take a nearest signal window.
   strategy: centered_single_window
+  alignment_method: rank_interpolation
 
 output:
-  bp_index: ./artifacts/processed/bp_index.csv
-  signal_index: ./artifacts/processed/signal_index.csv
-  sample_index: ./artifacts/processed/sample_index.csv
+  raw_manifest: ./artifacts/processed/v2/raw_manifest.csv
+  bp_index: ./artifacts/processed/v2/bp_index.csv
+  signal_index: ./artifacts/processed/v2/signal_index.csv
+  window_index: ./artifacts/processed/v2/window_index.csv
+  sample_index: ./artifacts/processed/v2/sample_index.csv
+  qc_report: ./artifacts/processed/v2/qc_report.json

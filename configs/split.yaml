@@ -1,5 +1,5 @@
 input:
-  sample_index: ./artifacts/processed/sample_index.csv
+  sample_index: ./artifacts/processed/v2/window_index.csv
 
 split:
   test_size: 0.2
@@ -7,4 +7,4 @@ split:
   group_kfold: 5
 
 output:
-  split_dir: ./artifacts/processed/splits
+  split_dir: ./artifacts/processed/v2/splits

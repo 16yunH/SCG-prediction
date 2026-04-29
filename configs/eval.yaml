@@ -4,3 +4,4 @@ input:
 output:
   metrics_summary: ./artifacts/metrics/metrics_summary.csv
   fold_metrics: ./artifacts/metrics/fold_metrics.csv
+  raw_metrics: ./artifacts/metrics/raw_metrics.csv
