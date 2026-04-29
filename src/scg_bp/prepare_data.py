@@ -91,6 +91,17 @@ def _safe_array_name(subject: str, session: str, idx: int) -> str:
     return "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in text) + ".npy"
 
 
+def _jitter_offsets(sample_rate_hz: int, stride_seconds: int, jitter_steps: int) -> list[tuple[int, int]]:
+    if jitter_steps <= 0 or stride_seconds <= 0:
+        return [(0, 0)]
+    offsets: list[tuple[int, int]] = []
+    for step in range(-jitter_steps, jitter_steps + 1):
+        offset_sec = int(step * stride_seconds)
+        offset_rows = int(round(offset_sec * sample_rate_hz))
+        offsets.append((offset_sec, offset_rows))
+    return offsets
+
+
 def build_signal_index(data_root: Path, arrays_dir: Path, sample_rate_hz: int, input_channels: int, materialize_arrays: bool) -> tuple[pd.DataFrame, list[dict[str, str]]]:
     records: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
@@ -117,10 +128,20 @@ def build_signal_index(data_root: Path, arrays_dir: Path, sample_rate_hz: int, i
     return out[[c for c in cols if c in out.columns]], failures
 
 
-def build_window_index(bp_index: pd.DataFrame, signal_index: pd.DataFrame, sample_rate_hz: int, window_seconds: int) -> tuple[pd.DataFrame, list[dict[str, str]]]:
+def build_window_index(
+    bp_index: pd.DataFrame,
+    signal_index: pd.DataFrame,
+    sample_rate_hz: int,
+    window_seconds: int,
+    alignment_method: str,
+    stride_seconds: int,
+    jitter_steps: int,
+) -> tuple[pd.DataFrame, list[dict[str, str]]]:
     rows: list[dict[str, Any]] = []
     exclusions: list[dict[str, str]] = []
     window_size = sample_rate_hz * window_seconds
+    offsets = _jitter_offsets(sample_rate_hz, stride_seconds, jitter_steps)
+    alignment = alignment_method if jitter_steps <= 0 else f"{alignment_method}+jitter"
     grouped_bp = bp_index.groupby(["subject_id", "session_id"], dropna=False)
     signal_map = signal_index.groupby(["subject_id", "session_id"], dropna=False)
 
@@ -147,32 +168,43 @@ def build_window_index(bp_index: pd.DataFrame, signal_index: pd.DataFrame, sampl
         for local_idx, bp_row in bp_group.iterrows():
             ratio = (local_idx + 1) / (n_bp + 1)
             center = int(ratio * n_rows)
-            start = max(0, min(center - window_size // 2, n_rows - window_size))
-            end = start + window_size
-            qc_flags = [] if candidate_scope == "same_session" else [candidate_scope]
-            if not str(bp_row.get("bp_time_token", "")):
-                qc_flags.append("missing_bp_time_token")
-            rows.append(
-                {
-                    "sample_id": f"{subject}_{session}_{local_idx:04d}",
-                    "subject_id": subject,
-                    "session_id": session,
-                    "signal_id": chosen["signal_id"],
-                    "signal_array": chosen.get("array_path", ""),
-                    "scg_file": chosen["source_file"],
-                    "scg_mode": chosen["channel_mode"],
-                    "start_row": int(start),
-                    "end_row": int(end),
-                    "window_size": int(window_size),
-                    "bp_time_token": bp_row.get("bp_time_token", ""),
-                    "SBP": float(bp_row["SBP"]),
-                    "DBP": float(bp_row["DBP"]),
-                    "HR": bp_row.get("HR", pd.NA),
-                    "PP": bp_row.get("PP", pd.NA),
-                    "alignment_method": "rank_interpolation",
-                    "qc_flags": ";".join(qc_flags),
-                }
-            )
+            seen: set[tuple[int, int]] = set()
+            for offset_idx, (offset_sec, offset_rows) in enumerate(offsets):
+                offset_center = center + offset_rows
+                start = max(0, min(offset_center - window_size // 2, n_rows - window_size))
+                end = start + window_size
+                key = (int(start), int(end))
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                qc_flags = [] if candidate_scope == "same_session" else [candidate_scope]
+                if not str(bp_row.get("bp_time_token", "")):
+                    qc_flags.append("missing_bp_time_token")
+                if offset_sec != 0:
+                    qc_flags.append(f"jitter_sec={offset_sec}")
+                rows.append(
+                    {
+                        "sample_id": f"{subject}_{session}_{local_idx:04d}_w{offset_idx:02d}",
+                        "subject_id": subject,
+                        "session_id": session,
+                        "signal_id": chosen["signal_id"],
+                        "signal_array": chosen.get("array_path", ""),
+                        "scg_file": chosen["source_file"],
+                        "scg_mode": chosen["channel_mode"],
+                        "start_row": int(start),
+                        "end_row": int(end),
+                        "window_size": int(window_size),
+                        "window_offset_sec": int(offset_sec),
+                        "bp_time_token": bp_row.get("bp_time_token", ""),
+                        "SBP": float(bp_row["SBP"]),
+                        "DBP": float(bp_row["DBP"]),
+                        "HR": bp_row.get("HR", pd.NA),
+                        "PP": bp_row.get("PP", pd.NA),
+                        "alignment_method": alignment,
+                        "qc_flags": ";".join(qc_flags),
+                    }
+                )
 
     if not rows:
         raise RuntimeError("No training windows generated. Check BP/SCG availability.")
@@ -183,19 +215,90 @@ def build_window_index(bp_index: pd.DataFrame, signal_index: pd.DataFrame, sampl
     return out, exclusions
 
 
-def build_qc_report(raw_manifest: pd.DataFrame, bp_index: pd.DataFrame, signal_index: pd.DataFrame, window_index: pd.DataFrame, failures: dict[str, Any], exclusions: list[dict[str, str]], window_seconds: int) -> dict[str, Any]:
+def _missing_rates(df: pd.DataFrame, columns: list[str]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for col in columns:
+        if col not in df.columns:
+            continue
+        vals = pd.to_numeric(df[col], errors="coerce")
+        out[col] = float(vals.isna().mean()) if len(vals) > 0 else float("nan")
+    return out
+
+
+def _apply_manifest_status(
+    raw_manifest: pd.DataFrame,
+    bp_index: pd.DataFrame,
+    signal_index: pd.DataFrame,
+    bp_failures: list[dict[str, str]],
+    scg_failures: list[dict[str, str]],
+) -> pd.DataFrame:
+    if raw_manifest.empty:
+        return raw_manifest
+    out = raw_manifest.copy()
+    bp_ok = set(bp_index.get("source_file", pd.Series(dtype=str)).astype(str).tolist()) if not bp_index.empty else set()
+    scg_ok = set(signal_index.get("source_file", pd.Series(dtype=str)).astype(str).tolist()) if not signal_index.empty else set()
+    bp_fail = {str(item.get("path", "")) for item in bp_failures}
+    scg_fail = {str(item.get("path", "")) for item in scg_failures}
+
+    def _status(row: pd.Series) -> str:
+        role = str(row.get("role", ""))
+        path = str(row.get("path", ""))
+        if role == "bp":
+            if path in bp_fail:
+                return "failed"
+            if path in bp_ok:
+                return "parsed"
+            return "skipped"
+        if role == "scg":
+            if path in scg_fail:
+                return "failed"
+            if path in scg_ok:
+                return "parsed"
+            return "skipped"
+        return "ignored"
+
+    out["parser_status"] = out.apply(_status, axis=1)
+    return out
+
+
+def build_qc_report(
+    raw_manifest: pd.DataFrame,
+    bp_index: pd.DataFrame,
+    signal_index: pd.DataFrame,
+    window_index: pd.DataFrame,
+    failures: dict[str, Any],
+    exclusions: list[dict[str, str]],
+    window_seconds: int,
+    alignment_method: str,
+    stride_seconds: int,
+    jitter_steps: int,
+) -> dict[str, Any]:
     subjects = sorted(s for s in raw_manifest["subject_id"].dropna().astype(str).unique().tolist() if s != "__root__") if not raw_manifest.empty else []
+    exclusions_map: dict[str, set[str]] = {}
+    for ex in exclusions:
+        subject = str(ex.get("subject_id", ""))
+        reason = str(ex.get("reason", ""))
+        if subject and reason:
+            exclusions_map.setdefault(subject, set()).add(reason)
     subject_rows = []
     for subject in subjects:
+        bp_sub = bp_index[bp_index["subject_id"].astype(str) == subject] if not bp_index.empty else pd.DataFrame()
+        missing = _missing_rates(bp_sub, ["SBP", "DBP", "HR", "PP"]) if not bp_sub.empty else {}
         subject_rows.append(
             {
                 "subject_id": subject,
                 "raw_files": int((raw_manifest["subject_id"].astype(str) == subject).sum()),
-                "bp_records": int((bp_index["subject_id"].astype(str) == subject).sum()) if not bp_index.empty else 0,
+                "bp_records": int(len(bp_sub)) if not bp_index.empty else 0,
+                "bp_missing_rate_sbp": missing.get("SBP", float("nan")),
+                "bp_missing_rate_dbp": missing.get("DBP", float("nan")),
+                "bp_missing_rate_hr": missing.get("HR", float("nan")),
+                "bp_missing_rate_pp": missing.get("PP", float("nan")),
                 "signal_files": int((signal_index["subject_id"].astype(str) == subject).sum()) if not signal_index.empty else 0,
                 "windows": int((window_index["subject_id"].astype(str) == subject).sum()) if not window_index.empty else 0,
+                "excluded_reasons": ";".join(sorted(exclusions_map.get(subject, set()))),
             }
         )
+    window_size = int(window_index["window_size"].iloc[0]) if not window_index.empty and "window_size" in window_index.columns else int(window_seconds)
     return {
         "raw_files": int(len(raw_manifest)),
         "subjects_scanned": int(len(subjects)),
@@ -205,10 +308,14 @@ def build_qc_report(raw_manifest: pd.DataFrame, bp_index: pd.DataFrame, signal_i
         "signal_files": int(len(signal_index)),
         "windows": int(len(window_index)),
         "window_seconds": int(window_seconds),
-        "alignment_method": "rank_interpolation",
+        "window_size": int(window_size),
+        "alignment_method": alignment_method,
+        "window_stride_seconds": int(stride_seconds),
+        "window_jitter_steps": int(jitter_steps),
         "excluded_subjects_note": "057a(BP) is excluded by default unless structured BP labels are provided.",
         "failures": failures,
         "exclusions": exclusions,
+        "trainable_samples": int(len(window_index)),
         "by_subject": subject_rows,
     }
 
@@ -221,12 +328,24 @@ def run(config_path: str, overrides: list[str] | None = None) -> None:
     sample_rate_hz = int(cfg["scg"]["sample_rate_hz"])
     input_channels = int(cfg.get("scg", {}).get("input_channels", 6))
     window_seconds = int(cfg["window"]["seconds"])
+    stride_seconds = int(cfg.get("window", {}).get("stride_seconds", 0))
+    jitter_steps = int(cfg.get("window", {}).get("jitter_steps", 0))
+    alignment_method = str(cfg.get("window", {}).get("alignment_method", "rank_interpolation"))
     materialize_arrays = bool(cfg.get("scg", {}).get("materialize_arrays", True))
 
     raw_manifest = build_raw_manifest(data_root)
     bp_index, bp_failures = build_bp_index(data_root, strict=bool(cfg.get("bp", {}).get("strict", False)))
     signal_index, scg_failures = build_signal_index(data_root, arrays_dir, sample_rate_hz, input_channels, materialize_arrays)
-    window_index, exclusions = build_window_index(bp_index, signal_index, sample_rate_hz, window_seconds)
+    window_index, exclusions = build_window_index(
+        bp_index,
+        signal_index,
+        sample_rate_hz,
+        window_seconds,
+        alignment_method,
+        stride_seconds,
+        jitter_steps,
+    )
+    raw_manifest = _apply_manifest_status(raw_manifest, bp_index, signal_index, bp_failures, scg_failures)
 
     out_cfg = cfg["output"]
     paths = {
@@ -255,6 +374,9 @@ def run(config_path: str, overrides: list[str] | None = None) -> None:
         {"bp": bp_failures, "scg": scg_failures},
         exclusions,
         window_seconds,
+        alignment_method,
+        stride_seconds,
+        jitter_steps,
     )
     save_json(paths["qc_report"], qc)
     print(

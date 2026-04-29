@@ -3,7 +3,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+    _HAS_MPL = True
+except Exception:  # noqa: BLE001
+    plt = None
+    _HAS_MPL = False
 import pandas as pd
 
 from .config import load_with_overrides
@@ -14,7 +19,27 @@ def _col(df: pd.DataFrame, preferred: str, fallback: str) -> str:
     return preferred if preferred in df.columns else fallback
 
 
+def _to_markdown_table(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "_No data_"
+    headers = [str(c) for c in df.columns]
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
+    for row in df.itertuples(index=False):
+        values: list[str] = []
+        for value in row:
+            if pd.isna(value):
+                values.append("")
+            elif pd.api.types.is_number(value):
+                values.append(f"{float(value):.4f}")
+            else:
+                values.append(str(value))
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines)
+
+
 def plot_mae_bars(df: pd.DataFrame, figure_dir: Path) -> None:
+    if not _HAS_MPL:
+        return
     plot_df = df.sort_values("model")
     sbp_col = _col(plot_df, "test_mae_sbp", "cv_val_mae_sbp_mean")
     dbp_col = _col(plot_df, "test_mae_dbp", "cv_val_mae_dbp_mean")
@@ -32,6 +57,8 @@ def plot_mae_bars(df: pd.DataFrame, figure_dir: Path) -> None:
 
 
 def plot_cv_scatter(fold_df: pd.DataFrame, figure_dir: Path) -> None:
+    if not _HAS_MPL:
+        return
     if fold_df.empty or "val_mae_sbp" not in fold_df.columns or "val_mae_dbp" not in fold_df.columns:
         return
     plt.figure(figsize=(8, 5))
@@ -74,7 +101,7 @@ def write_report(summary_df: pd.DataFrame, report_path: Path) -> None:
         if c in summary_df.columns
     ]
     table = summary_df[keep_cols].copy()
-    lines.append(table.to_markdown(index=False))
+    lines.append(_to_markdown_table(table))
     lines.extend(
         [
             "",

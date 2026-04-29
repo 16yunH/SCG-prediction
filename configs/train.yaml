@@ -8,15 +8,16 @@ runtime:
   pin_memory: true
   cache_windows: true
   mmap_arrays: true
+  allow_csv_fallback: false
   use_data_parallel: false
   gpu_ids: []
 
 optimization:
-  epochs: 30
-  batch_size: 512
+  epochs: 80
+  batch_size: 128
   learning_rate: 0.001
   weight_decay: 0.0001
-  early_stop_patience: 6
+  early_stop_patience: 10
 
 model:
   input_channels: 6

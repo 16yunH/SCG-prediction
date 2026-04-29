@@ -51,12 +51,21 @@ def _standardize_window(arr: np.ndarray, window_size: int, input_channels: int) 
 
 
 class ScgDataset(Dataset):
-    def __init__(self, sample_df: pd.DataFrame, input_channels: int, window_size: int, cache_windows: bool = True, mmap_arrays: bool = True) -> None:
+    def __init__(
+        self,
+        sample_df: pd.DataFrame,
+        input_channels: int,
+        window_size: int,
+        cache_windows: bool = True,
+        mmap_arrays: bool = True,
+        allow_csv_fallback: bool = False,
+    ) -> None:
         self.df = sample_df.reset_index(drop=True)
         self.input_channels = input_channels
         self.window_size = window_size
         self.cache_windows = cache_windows
         self.mmap_arrays = mmap_arrays
+        self.allow_csv_fallback = allow_csv_fallback
         self.array_cache: dict[str, np.ndarray] = {}
         self.x_cache: list[torch.Tensor] | None = None
         self.y_cache: list[torch.Tensor] | None = None
@@ -73,6 +82,9 @@ class ScgDataset(Dataset):
             if key not in self.array_cache:
                 self.array_cache[key] = np.load(array_path, mmap_mode="r" if self.mmap_arrays else None)
             return self.array_cache[key]
+
+        if not self.allow_csv_fallback:
+            raise FileNotFoundError(f"Missing array file: {array_path}")
 
         scg_file = str(row.get("scg_file", ""))
         mode = str(row.get("scg_mode", row.get("channel_mode", "7col")))
@@ -91,6 +103,8 @@ class ScgDataset(Dataset):
             end_row = max(start_row + 1, min(end_row, full.shape[0]))
             arr = np.asarray(full[start_row:end_row], dtype=np.float32)
         except Exception:
+            if not self.allow_csv_fallback:
+                raise
             path = Path(row["scg_file"])
             mode = str(row.get("scg_mode", "7col"))
             win = read_scg_window(path, start_row, end_row, mode, self.input_channels)
@@ -147,9 +161,34 @@ def run_epoch(model: nn.Module, loader: DataLoader, device: torch.device, optimi
     }
 
 
-def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, batch_size: int, workers: int, channels: int, window_size: int, pin_memory: bool, cache_windows: bool, mmap_arrays: bool) -> tuple[DataLoader, DataLoader]:
-    train_ds = ScgDataset(train_df, channels, window_size, cache_windows=cache_windows, mmap_arrays=mmap_arrays)
-    val_ds = ScgDataset(val_df, channels, window_size, cache_windows=cache_windows, mmap_arrays=mmap_arrays)
+def build_loaders(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    batch_size: int,
+    workers: int,
+    channels: int,
+    window_size: int,
+    pin_memory: bool,
+    cache_windows: bool,
+    mmap_arrays: bool,
+    allow_csv_fallback: bool,
+) -> tuple[DataLoader, DataLoader]:
+    train_ds = ScgDataset(
+        train_df,
+        channels,
+        window_size,
+        cache_windows=cache_windows,
+        mmap_arrays=mmap_arrays,
+        allow_csv_fallback=allow_csv_fallback,
+    )
+    val_ds = ScgDataset(
+        val_df,
+        channels,
+        window_size,
+        cache_windows=cache_windows,
+        mmap_arrays=mmap_arrays,
+        allow_csv_fallback=allow_csv_fallback,
+    )
     loader_kwargs: dict[str, Any] = {"batch_size": batch_size, "num_workers": workers, "pin_memory": pin_memory}
     if workers > 0:
         loader_kwargs["persistent_workers"] = True
@@ -177,6 +216,7 @@ def fit_one_fold(model_name: str, model_cfg: ModelConfig, train_df: pd.DataFrame
         bool(runtime_cfg.get("pin_memory", True)),
         bool(runtime_cfg.get("cache_windows", True)),
         bool(runtime_cfg.get("mmap_arrays", True)),
+        bool(runtime_cfg.get("allow_csv_fallback", False)),
     )
     best_val = float("inf")
     best_state = None
@@ -216,7 +256,14 @@ def fit_one_fold(model_name: str, model_cfg: ModelConfig, train_df: pd.DataFrame
 def evaluate_model(model: nn.Module, df: pd.DataFrame, cfg: dict[str, Any], model_cfg: ModelConfig, device: torch.device) -> dict[str, float]:
     runtime_cfg = cfg["runtime"]
     loader = DataLoader(
-        ScgDataset(df, model_cfg.input_channels, model_cfg.window_size, cache_windows=bool(runtime_cfg.get("cache_windows", True)), mmap_arrays=bool(runtime_cfg.get("mmap_arrays", True))),
+        ScgDataset(
+            df,
+            model_cfg.input_channels,
+            model_cfg.window_size,
+            cache_windows=bool(runtime_cfg.get("cache_windows", True)),
+            mmap_arrays=bool(runtime_cfg.get("mmap_arrays", True)),
+            allow_csv_fallback=bool(runtime_cfg.get("allow_csv_fallback", False)),
+        ),
         batch_size=int(cfg["optimization"]["batch_size"]),
         shuffle=False,
         num_workers=int(runtime_cfg["num_workers"]),
