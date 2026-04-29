@@ -13,11 +13,13 @@ runtime:
   gpu_ids: []
 
 optimization:
-  epochs: 80
-  batch_size: 128
+  epochs: 200
+  batch_size: 64
   learning_rate: 0.001
   weight_decay: 0.0001
-  early_stop_patience: 10
+  early_stop_patience: 30
+  target_standardize: true
+  final_validation_fold: 1
 
 model:
   input_channels: 6

@@ -1,5 +1,9 @@
 input:
   runs_dir: ./artifacts/runs
+  # Optional comma-separated filters to avoid mixing old experiments.
+  run_prefix: ""
+  run_contains: ""
+  mode: ""
 
 output:
   metrics_summary: ./artifacts/metrics/metrics_summary.csv

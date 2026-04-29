@@ -84,8 +84,8 @@ bash scripts/remote/launch_ablation_matrix.sh \
   --gpu-pool 1,2,3,5,6,7 \
   --folds 5 \
   --workers 4 \
-  --batch-size 512 \
-  --epochs 30 \
+  --batch-size 64 \
+  --epochs 200 \
   --include-final true
 ```
 
@@ -101,6 +101,7 @@ tmux attach -t ablation_gpu1
 ```bash
 python -m src.evaluate --config configs/eval.yaml \
   --override input.runs_dir=/home/jiajie/yhong/lsw/runs \
+  --override input.run_prefix=YYYYMMDD_HHMM \
   --override output.metrics_summary=/home/jiajie/yhong/lsw/artifacts/metrics/metrics_summary.csv \
   --override output.fold_metrics=/home/jiajie/yhong/lsw/artifacts/metrics/fold_metrics.csv
 

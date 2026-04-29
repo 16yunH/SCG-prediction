@@ -50,6 +50,22 @@ def _standardize_window(arr: np.ndarray, window_size: int, input_channels: int) 
     return ((arr - mean) / std).astype(np.float32, copy=False)
 
 
+def _target_stats(df: pd.DataFrame, enabled: bool) -> dict[str, list[float]]:
+    if not enabled:
+        return {"mean": [0.0, 0.0], "std": [1.0, 1.0]}
+    y = df[["SBP", "DBP"]].to_numpy(dtype=np.float32)
+    mean = y.mean(axis=0)
+    std = y.std(axis=0)
+    std = np.where(std < 1e-6, 1.0, std)
+    return {"mean": [float(mean[0]), float(mean[1])], "std": [float(std[0]), float(std[1])]}
+
+
+def _target_tensors(stats: dict[str, list[float]], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    mean = torch.tensor(stats["mean"], dtype=torch.float32, device=device).view(1, 2)
+    std = torch.tensor(stats["std"], dtype=torch.float32, device=device).view(1, 2)
+    return mean, std
+
+
 class ScgDataset(Dataset):
     def __init__(
         self,
@@ -59,6 +75,7 @@ class ScgDataset(Dataset):
         cache_windows: bool = True,
         mmap_arrays: bool = True,
         allow_csv_fallback: bool = False,
+        target_stats: dict[str, list[float]] | None = None,
     ) -> None:
         self.df = sample_df.reset_index(drop=True)
         self.input_channels = input_channels
@@ -66,6 +83,9 @@ class ScgDataset(Dataset):
         self.cache_windows = cache_windows
         self.mmap_arrays = mmap_arrays
         self.allow_csv_fallback = allow_csv_fallback
+        self.target_mean = np.asarray((target_stats or {"mean": [0.0, 0.0]})["mean"], dtype=np.float32)
+        self.target_std = np.asarray((target_stats or {"std": [1.0, 1.0]})["std"], dtype=np.float32)
+        self.target_std = np.where(self.target_std < 1e-6, 1.0, self.target_std).astype(np.float32)
         self.array_cache: dict[str, np.ndarray] = {}
         self.x_cache: list[torch.Tensor] | None = None
         self.y_cache: list[torch.Tensor] | None = None
@@ -111,7 +131,8 @@ class ScgDataset(Dataset):
             arr = win.to_numpy(dtype=np.float32)
         arr = _standardize_window(arr, self.window_size, self.input_channels)
         x = torch.from_numpy(arr.T.copy())
-        y = torch.tensor([float(row["SBP"]), float(row["DBP"])], dtype=torch.float32)
+        y_raw = np.asarray([float(row["SBP"]), float(row["DBP"])], dtype=np.float32)
+        y = torch.from_numpy(((y_raw - self.target_mean) / self.target_std).astype(np.float32))
         return x, y
 
     def _build_cache(self) -> None:
@@ -133,10 +154,17 @@ def mae_per_target(pred: torch.Tensor, target: torch.Tensor) -> tuple[float, flo
     return float(e[:, 0].mean().item()), float(e[:, 1].mean().item())
 
 
-def run_epoch(model: nn.Module, loader: DataLoader, device: torch.device, optimizer: torch.optim.Optimizer | None) -> dict[str, float]:
+def run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer | None,
+    target_stats: dict[str, list[float]],
+) -> dict[str, float]:
     train_mode = optimizer is not None
     model.train(train_mode)
     loss_fn = nn.SmoothL1Loss()
+    target_mean, target_std = _target_tensors(target_stats, device)
     losses: list[float] = []
     sbps: list[float] = []
     dbps: list[float] = []
@@ -151,7 +179,9 @@ def run_epoch(model: nn.Module, loader: DataLoader, device: torch.device, optimi
                 loss.backward()
                 optimizer.step()
         losses.append(float(loss.item()))
-        sbp, dbp = mae_per_target(pred.detach(), y)
+        pred_raw = pred.detach() * target_std + target_mean
+        y_raw = y * target_std + target_mean
+        sbp, dbp = mae_per_target(pred_raw, y_raw)
         sbps.append(sbp)
         dbps.append(dbp)
     return {
@@ -172,6 +202,7 @@ def build_loaders(
     cache_windows: bool,
     mmap_arrays: bool,
     allow_csv_fallback: bool,
+    target_stats: dict[str, list[float]],
 ) -> tuple[DataLoader, DataLoader]:
     train_ds = ScgDataset(
         train_df,
@@ -180,6 +211,7 @@ def build_loaders(
         cache_windows=cache_windows,
         mmap_arrays=mmap_arrays,
         allow_csv_fallback=allow_csv_fallback,
+        target_stats=target_stats,
     )
     val_ds = ScgDataset(
         val_df,
@@ -188,6 +220,7 @@ def build_loaders(
         cache_windows=cache_windows,
         mmap_arrays=mmap_arrays,
         allow_csv_fallback=allow_csv_fallback,
+        target_stats=target_stats,
     )
     loader_kwargs: dict[str, Any] = {"batch_size": batch_size, "num_workers": workers, "pin_memory": pin_memory}
     if workers > 0:
@@ -197,6 +230,8 @@ def build_loaders(
 
 def fit_one_fold(model_name: str, model_cfg: ModelConfig, train_df: pd.DataFrame, val_df: pd.DataFrame, cfg: dict[str, Any], device: torch.device) -> dict[str, Any]:
     runtime_cfg = cfg["runtime"]
+    opt_cfg = cfg["optimization"]
+    target_stats = _target_stats(train_df, enabled=bool(opt_cfg.get("target_standardize", True)))
     model = build_model(model_name, model_cfg).to(device)
     gpu_ids = normalize_gpu_ids(runtime_cfg.get("gpu_ids", []))
     if device.type == "cuda" and bool(runtime_cfg.get("use_data_parallel", False)) and len(gpu_ids) > 1:
@@ -204,7 +239,6 @@ def fit_one_fold(model_name: str, model_cfg: ModelConfig, train_df: pd.DataFrame
         dp_ids = [i for i in gpu_ids if i < visible]
         if len(dp_ids) > 1:
             model = nn.DataParallel(model, device_ids=dp_ids)
-    opt_cfg = cfg["optimization"]
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(opt_cfg["learning_rate"]), weight_decay=float(opt_cfg["weight_decay"]))
     train_loader, val_loader = build_loaders(
         train_df,
@@ -217,17 +251,23 @@ def fit_one_fold(model_name: str, model_cfg: ModelConfig, train_df: pd.DataFrame
         bool(runtime_cfg.get("cache_windows", True)),
         bool(runtime_cfg.get("mmap_arrays", True)),
         bool(runtime_cfg.get("allow_csv_fallback", False)),
+        target_stats,
     )
     best_val = float("inf")
     best_state = None
     patience = int(opt_cfg["early_stop_patience"])
     bad = 0
     history: list[dict[str, float]] = []
-    print(f"[fold] model={model_name} train={len(train_df)} val={len(val_df)} batch={int(opt_cfg['batch_size'])} epochs={int(opt_cfg['epochs'])}", flush=True)
+    print(
+        f"[fold] model={model_name} train={len(train_df)} val={len(val_df)} "
+        f"batch={int(opt_cfg['batch_size'])} epochs={int(opt_cfg['epochs'])} "
+        f"target_mean={target_stats['mean']} target_std={target_stats['std']}",
+        flush=True,
+    )
     for epoch in range(1, int(opt_cfg["epochs"]) + 1):
         t0 = time.time()
-        tr = run_epoch(model, train_loader, device, optimizer)
-        va = run_epoch(model, val_loader, device, optimizer=None)
+        tr = run_epoch(model, train_loader, device, optimizer, target_stats)
+        va = run_epoch(model, val_loader, device, optimizer=None, target_stats=target_stats)
         row = {"epoch": epoch, "epoch_seconds": time.time() - t0, **{f"train_{k}": v for k, v in tr.items()}, **{f"val_{k}": v for k, v in va.items()}}
         history.append(row)
         print(
@@ -250,10 +290,17 @@ def fit_one_fold(model_name: str, model_cfg: ModelConfig, train_df: pd.DataFrame
     if best_state is not None:
         model.load_state_dict(best_state)
     best_metrics = min(history, key=lambda r: r["val_mae_sbp"] + r["val_mae_dbp"])
-    return {"history": history, "best": best_metrics, "state_dict": model.state_dict()}
+    return {"history": history, "best": best_metrics, "state_dict": model.state_dict(), "target_stats": target_stats}
 
 
-def evaluate_model(model: nn.Module, df: pd.DataFrame, cfg: dict[str, Any], model_cfg: ModelConfig, device: torch.device) -> dict[str, float]:
+def evaluate_model(
+    model: nn.Module,
+    df: pd.DataFrame,
+    cfg: dict[str, Any],
+    model_cfg: ModelConfig,
+    device: torch.device,
+    target_stats: dict[str, list[float]],
+) -> dict[str, float]:
     runtime_cfg = cfg["runtime"]
     loader = DataLoader(
         ScgDataset(
@@ -263,13 +310,14 @@ def evaluate_model(model: nn.Module, df: pd.DataFrame, cfg: dict[str, Any], mode
             cache_windows=bool(runtime_cfg.get("cache_windows", True)),
             mmap_arrays=bool(runtime_cfg.get("mmap_arrays", True)),
             allow_csv_fallback=bool(runtime_cfg.get("allow_csv_fallback", False)),
+            target_stats=target_stats,
         ),
         batch_size=int(cfg["optimization"]["batch_size"]),
         shuffle=False,
         num_workers=int(runtime_cfg["num_workers"]),
         pin_memory=bool(runtime_cfg.get("pin_memory", True)),
     )
-    return run_epoch(model, loader, device, optimizer=None)
+    return run_epoch(model, loader, device, optimizer=None, target_stats=target_stats)
 
 
 def _device_from_cfg(runtime_cfg: dict[str, Any]) -> torch.device:
@@ -305,6 +353,23 @@ def _write_history(path: Path, history: list[dict[str, float]]) -> None:
         writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
         writer.writeheader()
         writer.writerows(history)
+
+
+def _final_train_val_split(trainval: pd.DataFrame, folds: pd.DataFrame, validation_fold: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    fold_map = folds[folds["fold"] == validation_fold][["sample_id", "subset"]]
+    if fold_map.empty:
+        raise ValueError(f"final_validation_fold={validation_fold} not found in folds.csv")
+    merged = trainval.merge(fold_map, on="sample_id", how="inner")
+    tr_df = merged[merged["subset"] == "train"].drop(columns=["subset"])
+    va_df = merged[merged["subset"] == "val"].drop(columns=["subset"])
+    if tr_df.empty or va_df.empty:
+        raise RuntimeError(f"Invalid final validation fold {validation_fold}: train={len(tr_df)} val={len(va_df)}")
+    tr_subjects = set(tr_df["subject_id"].astype(str))
+    va_subjects = set(va_df["subject_id"].astype(str))
+    overlap = tr_subjects & va_subjects
+    if overlap:
+        raise RuntimeError(f"Subject leakage in final validation fold {validation_fold}: {sorted(overlap)}")
+    return tr_df, va_df
 
 
 def run(model_name: str, config_path: str, overrides: list[str] | None = None, fold_filter: int | None = None, mode: str = "all") -> None:
@@ -347,18 +412,28 @@ def run(model_name: str, config_path: str, overrides: list[str] | None = None, f
             fold_dir = ensure_dir(run_dir / f"fold_{int(fold)}")
             _write_history(fold_dir / "metrics.csv", result["history"])
             torch.save(result["state_dict"], fold_dir / "best.pt")
+            save_json(fold_dir / "target_stats.json", result["target_stats"])
             print(f"[cv] fold={fold} best_val_mae=({fold_metrics[-1]['val_mae_sbp']:.3f},{fold_metrics[-1]['val_mae_dbp']:.3f})", flush=True)
 
     test_metrics: dict[str, float] = {"mae_sbp": float("nan"), "mae_dbp": float("nan"), "loss": float("nan")}
+    final_validation_fold = int(cfg["optimization"].get("final_validation_fold", 1))
+    final_target_stats: dict[str, list[float]] | None = None
     if mode in {"all", "final"} and fold_filter is None:
-        print("[final] training on trainval and evaluating holdout", flush=True)
-        final_result = fit_one_fold(model_name, model_cfg, trainval, test_df, cfg, device)
+        final_train, final_val = _final_train_val_split(trainval, folds, final_validation_fold)
+        print(
+            f"[final] training with internal validation fold={final_validation_fold} "
+            f"train={len(final_train)} val={len(final_val)} test={len(test_df)}",
+            flush=True,
+        )
+        final_result = fit_one_fold(model_name, model_cfg, final_train, final_val, cfg, device)
+        final_target_stats = final_result["target_stats"]
         final_model = build_model(model_name, model_cfg).to(device)
         final_model.load_state_dict(final_result["state_dict"])
-        test_metrics = evaluate_model(final_model, test_df, cfg, model_cfg, device)
+        test_metrics = evaluate_model(final_model, test_df, cfg, model_cfg, device, final_target_stats)
         final_dir = ensure_dir(run_dir / "final")
         _write_history(final_dir / "metrics.csv", final_result["history"])
         torch.save(final_result["state_dict"], final_dir / "best.pt")
+        save_json(final_dir / "target_stats.json", final_target_stats)
 
     if fold_metrics:
         pd.DataFrame(fold_metrics).to_csv(run_dir / "fold_metrics.csv", index=False)
@@ -375,6 +450,9 @@ def run(model_name: str, config_path: str, overrides: list[str] | None = None, f
         "test_mae_dbp": float(test_metrics["mae_dbp"]),
         "test_loss": float(test_metrics["loss"]),
         "runtime_seconds": float(time.time() - start_time),
+        "target_standardize": bool(cfg["optimization"].get("target_standardize", True)),
+        "final_validation_fold": final_validation_fold if mode in {"all", "final"} and fold_filter is None else None,
+        "final_target_stats": final_target_stats,
         "model_config": asdict(model_cfg),
     }
     save_json(run_dir / "metrics.json", summary)

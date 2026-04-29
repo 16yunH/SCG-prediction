@@ -13,8 +13,8 @@ GPU_POOL="1,2,3,5,6,7"
 FOLDS="5"
 MODELS="full,cnn_only,lstm_only,mlp_only"
 WORKERS="4"
-BATCH_SIZE="512"
-EPOCHS="30"
+BATCH_SIZE="64"
+EPOCHS="200"
 INCLUDE_FINAL="true"
 GPU_UTIL_THRESHOLD="30"
 GPU_MEM_THRESHOLD="50"
@@ -108,7 +108,9 @@ python -u -m src.train --model ${model} --config configs/train.yaml ${extra} \
   --override optimization.epochs=${EPOCHS} \
   --override runtime.pin_memory=true \
   --override runtime.cache_windows=true \
-  --override runtime.mmap_arrays=true
+  --override runtime.mmap_arrays=true \
+  --override optimization.target_standardize=true \
+  --override optimization.final_validation_fold=1
 EOF
 }
 
