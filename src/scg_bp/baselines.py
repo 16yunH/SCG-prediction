@@ -111,6 +111,21 @@ def _predict_mean(mean: np.ndarray, n: int) -> np.ndarray:
     return np.repeat(mean, n, axis=0)
 
 
+def _fit_subject_mean(train_df: pd.DataFrame) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    y_train = train_df[TARGET_COLUMNS].to_numpy(dtype=np.float32)
+    global_mean = _fit_mean(y_train)[0]
+    subject_means = {
+        str(subject): g[TARGET_COLUMNS].to_numpy(dtype=np.float32).mean(axis=0)
+        for subject, g in train_df.groupby("subject_id")
+    }
+    return global_mean.astype(np.float32), subject_means
+
+
+def _predict_subject_mean(eval_df: pd.DataFrame, global_mean: np.ndarray, subject_means: dict[str, np.ndarray]) -> np.ndarray:
+    rows = [subject_means.get(str(row["subject_id"]), global_mean) for _, row in eval_df.iterrows()]
+    return np.vstack(rows).astype(np.float32)
+
+
 def _standardize_x(x_train: np.ndarray, x_eval: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     mean = x_train.mean(axis=0, keepdims=True)
     std = x_train.std(axis=0, keepdims=True)
@@ -142,6 +157,27 @@ def _select_alpha(x_train: np.ndarray, y_train: np.ndarray, x_val: np.ndarray, y
     best_score = sum(_mae(best_pred, y_val))
     for alpha in alphas[1:]:
         pred = _ridge_eval(x_train, y_train, x_val, float(alpha))
+        score = sum(_mae(pred, y_val))
+        if score < best_score:
+            best_alpha = float(alpha)
+            best_pred = pred
+            best_score = score
+    return best_alpha, best_pred, float(best_score)
+
+
+def _select_residual_alpha(
+    x_train: np.ndarray,
+    residual_train: np.ndarray,
+    x_val: np.ndarray,
+    y_val: np.ndarray,
+    base_val: np.ndarray,
+    alphas: list[float],
+) -> tuple[float, np.ndarray, float]:
+    best_alpha = float(alphas[0])
+    best_pred = base_val + _ridge_eval(x_train, residual_train, x_val, best_alpha)
+    best_score = sum(_mae(best_pred, y_val))
+    for alpha in alphas[1:]:
+        pred = base_val + _ridge_eval(x_train, residual_train, x_val, float(alpha))
         score = sum(_mae(pred, y_val))
         if score < best_score:
             best_alpha = float(alpha)
@@ -229,6 +265,60 @@ def _run_mean_baseline(
     )
 
 
+def _run_subject_mean_baseline(
+    run_dir: Path,
+    trainval: pd.DataFrame,
+    folds: pd.DataFrame,
+    test: pd.DataFrame,
+    runtime_seconds: float,
+) -> None:
+    fold_rows = []
+    for fold in sorted(int(x) for x in folds["fold"].unique()):
+        train_df, val_df = _fold_frames(trainval, folds, fold)
+        y_val = val_df[TARGET_COLUMNS].to_numpy(dtype=np.float32)
+        global_mean, subject_means = _fit_subject_mean(train_df)
+        pred = _predict_subject_mean(val_df, global_mean, subject_means)
+        mae_sbp, mae_dbp = _mae(pred, y_val)
+        fallback_count = int(sum(str(s) not in subject_means for s in val_df["subject_id"]))
+        fold_rows.append(
+            {
+                "model": "subject_mean_baseline",
+                "fold": fold,
+                "val_mae_sbp": mae_sbp,
+                "val_mae_dbp": mae_dbp,
+                "val_loss": float((mae_sbp + mae_dbp) / 2),
+                "fallback_count": fallback_count,
+                "run_dir": str(run_dir),
+            }
+        )
+    global_mean, subject_means = _fit_subject_mean(trainval)
+    test_y = test[TARGET_COLUMNS].to_numpy(dtype=np.float32)
+    test_pred = _predict_subject_mean(test, global_mean, subject_means)
+    test_sbp, test_dbp = _mae(test_pred, test_y)
+    _write_fold_metrics(run_dir, fold_rows)
+    _write_predictions(run_dir / "test_predictions.csv", test, test_pred)
+    pred_df = pd.read_csv(run_dir / "test_predictions.csv")
+    _write_subject_errors(run_dir / "test_subject_errors.csv", pred_df)
+    save_json(
+        run_dir / "metrics.json",
+        {
+            "model": "subject_mean_baseline",
+            "mode": "all",
+            "fold": None,
+            "device": "numpy",
+            "run_dir": str(run_dir),
+            "folds": len(fold_rows),
+            "cv_val_mae_sbp": float(np.mean([r["val_mae_sbp"] for r in fold_rows])),
+            "cv_val_mae_dbp": float(np.mean([r["val_mae_dbp"] for r in fold_rows])),
+            "test_mae_sbp": test_sbp,
+            "test_mae_dbp": test_dbp,
+            "test_loss": float((test_sbp + test_dbp) / 2),
+            "runtime_seconds": runtime_seconds,
+            "fallback_count": int(sum(str(s) not in subject_means for s in test["subject_id"])),
+        },
+    )
+
+
 def _run_ridge_baseline(
     run_dir: Path,
     trainval: pd.DataFrame,
@@ -290,6 +380,99 @@ def _run_ridge_baseline(
     )
 
 
+def _run_subject_ridge_residual_baseline(
+    run_dir: Path,
+    trainval: pd.DataFrame,
+    folds: pd.DataFrame,
+    test: pd.DataFrame,
+    cfg: dict[str, Any],
+    features: dict[str, tuple[np.ndarray, np.ndarray]],
+    runtime_seconds: float,
+) -> None:
+    alphas = [float(x) for x in cfg["ridge"]["alphas"]]
+    x_trainval, y_trainval = features["trainval"]
+    x_test, y_test = features["test"]
+    trainval_index = {sample_id: i for i, sample_id in enumerate(trainval["sample_id"].astype(str))}
+    fold_rows = []
+    for fold in sorted(int(x) for x in folds["fold"].unique()):
+        train_df, val_df = _fold_frames(trainval, folds, fold)
+        train_idx = [trainval_index[x] for x in train_df["sample_id"].astype(str)]
+        val_idx = [trainval_index[x] for x in val_df["sample_id"].astype(str)]
+        global_mean, subject_means = _fit_subject_mean(train_df)
+        base_train = _predict_subject_mean(train_df, global_mean, subject_means)
+        base_val = _predict_subject_mean(val_df, global_mean, subject_means)
+        residual_train = y_trainval[train_idx] - base_train
+        alpha, pred, _ = _select_residual_alpha(
+            x_trainval[train_idx],
+            residual_train,
+            x_trainval[val_idx],
+            y_trainval[val_idx],
+            base_val,
+            alphas,
+        )
+        mae_sbp, mae_dbp = _mae(pred, y_trainval[val_idx])
+        fallback_count = int(sum(str(s) not in subject_means for s in val_df["subject_id"]))
+        fold_rows.append(
+            {
+                "model": "subject_ridge_residual",
+                "fold": fold,
+                "val_mae_sbp": mae_sbp,
+                "val_mae_dbp": mae_dbp,
+                "val_loss": float((mae_sbp + mae_dbp) / 2),
+                "alpha": alpha,
+                "fallback_count": fallback_count,
+                "run_dir": str(run_dir),
+            }
+        )
+    final_fold = int(cfg["ridge"].get("final_validation_fold", 1))
+    final_train, final_val = _fold_frames(trainval, folds, final_fold)
+    final_train_idx = [trainval_index[x] for x in final_train["sample_id"].astype(str)]
+    final_val_idx = [trainval_index[x] for x in final_val["sample_id"].astype(str)]
+    global_mean, subject_means = _fit_subject_mean(final_train)
+    base_final_train = _predict_subject_mean(final_train, global_mean, subject_means)
+    base_final_val = _predict_subject_mean(final_val, global_mean, subject_means)
+    residual_final_train = y_trainval[final_train_idx] - base_final_train
+    final_alpha, _, _ = _select_residual_alpha(
+        x_trainval[final_train_idx],
+        residual_final_train,
+        x_trainval[final_val_idx],
+        y_trainval[final_val_idx],
+        base_final_val,
+        alphas,
+    )
+    global_mean, subject_means = _fit_subject_mean(trainval)
+    base_trainval = _predict_subject_mean(trainval, global_mean, subject_means)
+    base_test = _predict_subject_mean(test, global_mean, subject_means)
+    residual_trainval = y_trainval - base_trainval
+    test_pred = base_test + _ridge_eval(x_trainval, residual_trainval, x_test, final_alpha)
+    test_sbp, test_dbp = _mae(test_pred, y_test)
+    _write_fold_metrics(run_dir, fold_rows)
+    _write_predictions(run_dir / "test_predictions.csv", test, test_pred)
+    pred_df = pd.read_csv(run_dir / "test_predictions.csv")
+    _write_subject_errors(run_dir / "test_subject_errors.csv", pred_df)
+    save_json(
+        run_dir / "metrics.json",
+        {
+            "model": "subject_ridge_residual",
+            "mode": "all",
+            "fold": None,
+            "device": "numpy",
+            "run_dir": str(run_dir),
+            "folds": len(fold_rows),
+            "cv_val_mae_sbp": float(np.mean([r["val_mae_sbp"] for r in fold_rows])),
+            "cv_val_mae_dbp": float(np.mean([r["val_mae_dbp"] for r in fold_rows])),
+            "test_mae_sbp": test_sbp,
+            "test_mae_dbp": test_dbp,
+            "test_loss": float((test_sbp + test_dbp) / 2),
+            "runtime_seconds": runtime_seconds,
+            "alphas": alphas,
+            "final_alpha": final_alpha,
+            "final_validation_fold": final_fold,
+            "fallback_count": int(sum(str(s) not in subject_means for s in test["subject_id"])),
+        },
+    )
+
+
 def run(config_path: str, overrides: list[str] | None = None) -> None:
     cfg = load_with_overrides(config_path, overrides)
     set_seed(42)
@@ -316,12 +499,27 @@ def run(config_path: str, overrides: list[str] | None = None) -> None:
     }
     feature_seconds = time.time() - t0
     mean_dir = ensure_dir(runs_dir / f"{tag}_mean_baseline")
+    subject_mean_dir = ensure_dir(runs_dir / f"{tag}_subject_mean_baseline")
     ridge_dir = ensure_dir(runs_dir / f"{tag}_ridge_features")
+    subject_ridge_dir = ensure_dir(runs_dir / f"{tag}_subject_ridge_residual")
     save_json(mean_dir / "config.resolved.json", cfg)
+    save_json(subject_mean_dir / "config.resolved.json", cfg)
     save_json(ridge_dir / "config.resolved.json", cfg)
+    save_json(subject_ridge_dir / "config.resolved.json", cfg)
     _run_mean_baseline(mean_dir, trainval, folds, test, features, feature_seconds)
+    _run_subject_mean_baseline(subject_mean_dir, trainval, folds, test, feature_seconds)
     _run_ridge_baseline(ridge_dir, trainval, folds, test, cfg, features, time.time() - t0)
-    print({"done": "baselines", "mean_run": str(mean_dir), "ridge_run": str(ridge_dir)}, flush=True)
+    _run_subject_ridge_residual_baseline(subject_ridge_dir, trainval, folds, test, cfg, features, time.time() - t0)
+    print(
+        {
+            "done": "baselines",
+            "mean_run": str(mean_dir),
+            "subject_mean_run": str(subject_mean_dir),
+            "ridge_run": str(ridge_dir),
+            "subject_ridge_run": str(subject_ridge_dir),
+        },
+        flush=True,
+    )
 
 
 def main() -> None:

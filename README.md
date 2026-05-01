@@ -78,6 +78,19 @@ python -m src.baselines --config configs/baseline.yaml \
   --override output.runs_dir=./artifacts/runs_baselines
 ```
 
+Run stronger feature/residual baselines for small-data analysis:
+
+```bash
+python -m src.advanced_baselines --config configs/advanced_baseline.yaml \
+  --override input.split_dir=./artifacts/processed/v2/calibrated_splits \
+  --override output.runs_dir=./artifacts/runs_advanced_baselines
+```
+
+The residual variants first subtract each subject's train-set BP mean and then
+fit SCG-derived residuals. They are intended for calibrated protocols where the
+same subject has prior BP labels; on unseen-subject splits they fall back to the
+global train mean.
+
 Create a subject-dependent calibrated split. This keeps all subjects in both
 train/test but splits by BP label group, so the three jitter windows from one BP
 measurement cannot leak across subsets:

@@ -2,6 +2,7 @@
 
 __all__ = [
     "config",
+    "advanced_baselines",
     "prepare_data",
     "split",
     "calibrated_split",

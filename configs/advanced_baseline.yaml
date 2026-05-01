@@ -1,0 +1,20 @@
+input:
+  split_dir: ./artifacts/processed/v2/splits
+
+features:
+  input_channels: 6
+  window_size: 400
+  include_hr: false
+  include_window_meta: true
+
+models:
+  random_seed: 42
+  n_estimators: 500
+  min_samples_leaf: 2
+  max_features: sqrt
+  hist_max_iter: 300
+  hist_learning_rate: 0.03
+  hist_l2_regularization: 0.1
+
+output:
+  runs_dir: ./artifacts/runs
