@@ -156,6 +156,21 @@ some BP labels from the same people are available.
 
 ## Remote 8-GPU Ablation Matrix
 
+For the current v3 TCN experiment, use the one-command server launcher. It
+pulls `main`, prepares v3 data, creates both split protocols, and starts
+calibrated final + 5-fold CV jobs in tmux:
+
+```bash
+bash scripts/remote/train_v3_8gpu.sh \
+  --project-dir /home/jiajie/yhong/lsw/project \
+  --data-root /home/jiajie/yhong/lsw/data \
+  --conda-env lsw-bp \
+  --gpu-pool 0,1,2,3,4,5,6,7
+```
+
+Monitor with `tmux ls`, `tail -f /home/jiajie/yhong/lsw/runs_v3/logs/*.log`,
+and `watch -n 5 nvidia-smi`.
+
 Use the queue launcher to run model/fold jobs across available GPUs with live tmux output and persistent logs:
 
 ```bash
