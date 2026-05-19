@@ -7,7 +7,7 @@ set -euo pipefail
 PROJECT_DIR="/home/jiajie/yhong/lsw/project"
 BRANCH="main"
 SESSION_NAME="train_full"
-TRAIN_CMD="python -m src.train --model full --config configs/train.yaml --override paths.data_root=/home/jiajie/yhong/lsw/data --override paths.processed_dir=/home/jiajie/yhong/lsw/artifacts/processed --override output.runs_dir=/home/jiajie/yhong/lsw/runs"
+TRAIN_CMD="python -m src train --model full --config configs/train.yaml --override paths.data_root=/home/jiajie/yhong/lsw/data --override paths.processed_dir=/home/jiajie/yhong/lsw/artifacts/processed --override output.runs_dir=/home/jiajie/yhong/lsw/runs"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -24,7 +24,7 @@ git fetch origin
 git checkout "$BRANCH"
 git pull --ff-only origin "$BRANCH"
 
-python -m src.prepare_data --config configs/data.yaml --override paths.data_root=/home/jiajie/yhong/lsw/data --override paths.processed_dir=/home/jiajie/yhong/lsw/artifacts/processed --override output.bp_index=/home/jiajie/yhong/lsw/artifacts/processed/bp_index.csv --override output.signal_index=/home/jiajie/yhong/lsw/artifacts/processed/signal_index.csv --override output.sample_index=/home/jiajie/yhong/lsw/artifacts/processed/sample_index.csv
-python -m src.make_splits --config configs/split.yaml --override input.sample_index=/home/jiajie/yhong/lsw/artifacts/processed/sample_index.csv --override output.split_dir=/home/jiajie/yhong/lsw/artifacts/processed/splits
+python -m src prepare-data --config configs/data.yaml --override paths.data_root=/home/jiajie/yhong/lsw/data --override paths.processed_dir=/home/jiajie/yhong/lsw/artifacts/processed --override output.bp_index=/home/jiajie/yhong/lsw/artifacts/processed/bp_index.csv --override output.signal_index=/home/jiajie/yhong/lsw/artifacts/processed/signal_index.csv --override output.sample_index=/home/jiajie/yhong/lsw/artifacts/processed/sample_index.csv
+python -m src make-splits --config configs/split.yaml --override input.sample_index=/home/jiajie/yhong/lsw/artifacts/processed/sample_index.csv --override output.split_dir=/home/jiajie/yhong/lsw/artifacts/processed/splits
 
 bash scripts/remote/run_with_gpu_guard.sh --session "$SESSION_NAME" --command "$TRAIN_CMD"

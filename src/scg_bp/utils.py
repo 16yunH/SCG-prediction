@@ -56,6 +56,29 @@ def parse_bp_time_token(token: Any) -> str:
     return digits.zfill(6)
 
 
+def bp_token_to_minutes(token: Any) -> int | None:
+    """Parse a DDHHMM-style BP time token to absolute minutes within a month."""
+    text = parse_bp_time_token(token)
+    if len(text) != 6:
+        return None
+    try:
+        day = int(text[:2])
+        hour = int(text[2:4])
+        minute = int(text[4:6])
+    except ValueError:
+        return None
+    if hour >= 24 or minute >= 60:
+        return None
+    return day * 24 * 60 + hour * 60 + minute
+
+
+def minutes_to_bp_token(minutes: int) -> str:
+    """Format absolute minutes within a month as DDHHMM."""
+    day, rem = divmod(int(round(minutes)), 24 * 60)
+    hour, minute = divmod(rem, 60)
+    return f"{day:02d}{hour:02d}{minute:02d}"
+
+
 def pick_column(columns: list[str], candidates: list[str]) -> str | None:
     lower_map = {c.lower(): c for c in columns}
     for cand in candidates:

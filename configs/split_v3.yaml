@@ -1,0 +1,11 @@
+input:
+  sample_index: ./artifacts/processed/v3/window_index.csv
+  include_label_sources: [measured_bp, interpolated_bp]
+
+split:
+  test_size: 0.2
+  random_seed: 42
+  group_kfold: 5
+
+output:
+  split_dir: ./artifacts/processed/v3/splits

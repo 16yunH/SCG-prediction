@@ -4,11 +4,16 @@ End-to-end pipeline for local development, GitHub sync, structured data preparat
 
 ## Project Layout
 
-- `src/scg_bp/`: core data, split, training, evaluation, and report code
-- `src/*.py`: public CLI entry modules
-- `configs/`: YAML configs
-- `scripts/remote/`: server scripts for GPU guarded training and ablation matrix launch
-- `tests/`: smoke tests
+- `src/__main__.py`: unified CLI entry; run commands as `python -m src <command>`
+- `src/scg_bp/data/`: BP/SCG parsers, raw manifests, and window-index construction
+- `src/scg_bp/splits/`: subject-independent and calibrated split builders
+- `src/scg_bp/modeling/`: neural models, training loop, and tabular baselines
+- `src/scg_bp/reporting/`: metrics aggregation and report generation
+- `configs/`: YAML configs for data prep, splits, training, baselines, and reports
+- `scripts/remote/`: server launch scripts for GPU guarded training and ablations
+- `tests/`: smoke tests for parsers, split integrity, and v3 window logic
+
+After editable install, the same interface is available as `scg-bp <command>`.
 
 ## Structured Data Pipeline
 
@@ -22,14 +27,39 @@ The v2 data pipeline converts mixed raw files into reusable assets under `artifa
 - `qc_report.json`: subject-level counts, exclusions, and parser failures
 
 ```bash
-python -m src.prepare_data --config configs/data.yaml
-python -m src.make_splits --config configs/split.yaml
+python -m src prepare-data --config configs/data.yaml
+python -m src make-splits --config configs/split.yaml
+```
+
+## V3 High-Utilization Pipeline
+
+The v3 pipeline increases supervised SCG coverage by adding multi-scale measured windows, linearly interpolated weak-label windows between adjacent BP measurements, and unlabeled windows for future self-supervised pretraining. Final MAE should still be reported only on measured BP samples.
+Track completed and planned runs in `docs/experiment_matrix.md`.
+
+```bash
+python -m src prepare-data --config configs/data_v3.yaml
+python -m src make-splits --config configs/split_v3.yaml
+python -m src make-calibrated-splits --config configs/calibrated_split_v3.yaml
+```
+
+Train the new TCN model on subject-independent splits:
+
+```bash
+python -m src train --model tcn --config configs/train_v3.yaml
+```
+
+Train on calibrated splits:
+
+```bash
+python -m src train --model tcn --config configs/train_v3.yaml \
+  --override input.split_dir=./artifacts/processed/v3/calibrated_splits \
+  --override optimization.allow_subject_overlap_validation=true
 ```
 
 Server example:
 
 ```bash
-python -m src.prepare_data --config configs/data.yaml \
+python -m src prepare-data --config configs/data.yaml \
   --override paths.data_root=/home/jiajie/yhong/lsw/data \
   --override paths.processed_dir=/home/jiajie/yhong/lsw/artifacts/processed/v2 \
   --override paths.arrays_dir=/home/jiajie/yhong/lsw/artifacts/processed/v2/arrays \
@@ -41,7 +71,7 @@ python -m src.prepare_data --config configs/data.yaml \
   --override output.qc_report=/home/jiajie/yhong/lsw/artifacts/processed/v2/qc_report.json \
   --override bp.strict=true
 
-python -m src.make_splits --config configs/split.yaml \
+python -m src make-splits --config configs/split.yaml \
   --override input.sample_index=/home/jiajie/yhong/lsw/artifacts/processed/v2/window_index.csv \
   --override output.split_dir=/home/jiajie/yhong/lsw/artifacts/processed/v2/splits
 ```
@@ -51,19 +81,19 @@ python -m src.make_splits --config configs/split.yaml \
 Single model, all folds plus final holdout:
 
 ```bash
-python -m src.train --model full --config configs/train.yaml
+python -m src train --model full --config configs/train.yaml
 ```
 
 Single fold task, useful for GPU matrix scheduling:
 
 ```bash
-python -m src.train --model full --config configs/train.yaml --mode cv --fold 1
+python -m src train --model full --config configs/train.yaml --mode cv --fold 1
 ```
 
 Final holdout-only task:
 
 ```bash
-python -m src.train --model full --config configs/train.yaml --mode final
+python -m src train --model full --config configs/train.yaml --mode final
 ```
 
 Training reads `window_index.csv + arrays/*.npy` through split files. It only falls back to raw CSV reads for debugging or legacy indices.
@@ -73,7 +103,7 @@ Training reads `window_index.csv + arrays/*.npy` through split files. It only fa
 Run non-neural baselines on an existing split:
 
 ```bash
-python -m src.baselines --config configs/baseline.yaml \
+python -m src baselines --config configs/baseline.yaml \
   --override input.split_dir=./artifacts/processed/v2/splits \
   --override output.runs_dir=./artifacts/runs_baselines
 ```
@@ -81,7 +111,7 @@ python -m src.baselines --config configs/baseline.yaml \
 Run stronger feature/residual baselines for small-data analysis:
 
 ```bash
-python -m src.advanced_baselines --config configs/advanced_baseline.yaml \
+python -m src advanced-baselines --config configs/advanced_baseline.yaml \
   --override input.split_dir=./artifacts/processed/v2/calibrated_splits \
   --override output.runs_dir=./artifacts/runs_advanced_baselines
 ```
@@ -96,7 +126,7 @@ train/test but splits by BP label group, so the three jitter windows from one BP
 measurement cannot leak across subsets:
 
 ```bash
-python -m src.make_calibrated_splits --config configs/calibrated_split.yaml \
+python -m src make-calibrated-splits --config configs/calibrated_split.yaml \
   --override input.sample_index=./artifacts/processed/v2/window_index.csv \
   --override output.split_dir=./artifacts/processed/v2/calibrated_splits
 ```
@@ -104,7 +134,7 @@ python -m src.make_calibrated_splits --config configs/calibrated_split.yaml \
 Train on the calibrated split:
 
 ```bash
-python -m src.train --model cnn_only --config configs/train.yaml \
+python -m src train --model cnn_only --config configs/train.yaml \
   --override input.split_dir=./artifacts/processed/v2/calibrated_splits \
   --override optimization.allow_subject_overlap_validation=true
 ```
@@ -113,7 +143,7 @@ Use 5-fold CV checkpoint ensembling for the calibrated test set. This avoids
 depending on a single final validation fold:
 
 ```bash
-python -m src.train --model cnn_only --config configs/train.yaml \
+python -m src train --model cnn_only --config configs/train.yaml \
   --override input.split_dir=./artifacts/processed/v2/calibrated_splits \
   --override optimization.allow_subject_overlap_validation=true \
   --override optimization.test_strategy=cv_ensemble \
@@ -155,13 +185,13 @@ tmux attach -t ablation_gpu1
 ## Evaluation And Report
 
 ```bash
-python -m src.evaluate --config configs/eval.yaml \
+python -m src evaluate --config configs/eval.yaml \
   --override input.runs_dir=/home/jiajie/yhong/lsw/runs \
   --override input.run_prefix=YYYYMMDD_HHMM \
   --override output.metrics_summary=/home/jiajie/yhong/lsw/artifacts/metrics/metrics_summary.csv \
   --override output.fold_metrics=/home/jiajie/yhong/lsw/artifacts/metrics/fold_metrics.csv
 
-python -m src.report --config configs/report.yaml \
+python -m src report --config configs/report.yaml \
   --override input.metrics_summary=/home/jiajie/yhong/lsw/artifacts/metrics/metrics_summary.csv \
   --override input.fold_metrics=/home/jiajie/yhong/lsw/artifacts/metrics/fold_metrics.csv \
   --override output.figure_dir=/home/jiajie/yhong/lsw/artifacts/figures \

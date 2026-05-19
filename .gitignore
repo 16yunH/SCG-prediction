@@ -1,10 +1,11 @@
 __pycache__/
 *.pyc
 .venv/
-artifacts/
-data/
+/artifacts/
+/data/
 *.pt
 *.log
 .DS_Store
-tmp*/
-requirement.txt
+/tmp*/
+/requirement.txt
+AGENTS.md

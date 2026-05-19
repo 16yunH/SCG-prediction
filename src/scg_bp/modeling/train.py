@@ -13,10 +13,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from .config import load_with_overrides
-from .io_scg import read_scg_full_array, read_scg_window
+from ..config import load_with_overrides
+from ..data.io_scg import read_scg_full_array, read_scg_window
+from ..utils import ensure_dir, now_tag, save_json, set_seed
 from .models import ModelConfig, build_model
-from .utils import ensure_dir, now_tag, save_json, set_seed
 
 
 def normalize_gpu_ids(raw: Any) -> list[int]:
@@ -54,10 +54,30 @@ def _target_stats(df: pd.DataFrame, enabled: bool) -> dict[str, list[float]]:
     if not enabled:
         return {"mean": [0.0, 0.0], "std": [1.0, 1.0]}
     y = df[["SBP", "DBP"]].to_numpy(dtype=np.float32)
-    mean = y.mean(axis=0)
-    std = y.std(axis=0)
+    if "label_weight" in df.columns:
+        weights = pd.to_numeric(df["label_weight"], errors="coerce").fillna(1.0).to_numpy(dtype=np.float32)
+        weights = np.where(weights > 0, weights, 0.0)
+        if float(weights.sum()) > 1e-6:
+            mean = (y * weights[:, None]).sum(axis=0) / weights.sum()
+            var = (((y - mean) ** 2) * weights[:, None]).sum(axis=0) / weights.sum()
+            std = np.sqrt(var)
+        else:
+            mean = y.mean(axis=0)
+            std = y.std(axis=0)
+    else:
+        mean = y.mean(axis=0)
+        std = y.std(axis=0)
     std = np.where(std < 1e-6, 1.0, std)
     return {"mean": [float(mean[0]), float(mean[1])], "std": [float(std[0]), float(std[1])]}
+
+
+def _measured_eval_df(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "label_source" in out.columns:
+        measured = out[out["label_source"].astype(str) == "measured_bp"]
+        if not measured.empty:
+            out = measured
+    return out.dropna(subset=["SBP", "DBP"]).reset_index(drop=True)
 
 
 def _target_tensors(stats: dict[str, list[float]], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -89,6 +109,7 @@ class ScgDataset(Dataset):
         self.array_cache: dict[str, np.ndarray] = {}
         self.x_cache: list[torch.Tensor] | None = None
         self.y_cache: list[torch.Tensor] | None = None
+        self.w_cache: list[torch.Tensor] | None = None
         if self.cache_windows:
             self._build_cache()
 
@@ -113,7 +134,7 @@ class ScgDataset(Dataset):
             self.array_cache[key] = read_scg_full_array(Path(scg_file), mode, self.input_channels)
         return self.array_cache[key]
 
-    def _row_to_xy(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _row_to_xy(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         row = self.df.iloc[idx]
         start_row = int(row["start_row"])
         end_row = int(row["end_row"])
@@ -133,19 +154,23 @@ class ScgDataset(Dataset):
         x = torch.from_numpy(arr.T.copy())
         y_raw = np.asarray([float(row["SBP"]), float(row["DBP"])], dtype=np.float32)
         y = torch.from_numpy(((y_raw - self.target_mean) / self.target_std).astype(np.float32))
-        return x, y
+        weight = float(row.get("label_weight", 1.0) or 1.0)
+        w = torch.tensor(max(0.0, weight), dtype=torch.float32)
+        return x, y, w
 
     def _build_cache(self) -> None:
         self.x_cache = []
         self.y_cache = []
+        self.w_cache = []
         for idx in range(len(self.df)):
-            x, y = self._row_to_xy(idx)
+            x, y, w = self._row_to_xy(idx)
             self.x_cache.append(x)
             self.y_cache.append(y)
+            self.w_cache.append(w)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.x_cache is not None and self.y_cache is not None:
-            return self.x_cache[idx], self.y_cache[idx]
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.x_cache is not None and self.y_cache is not None and self.w_cache is not None:
+            return self.x_cache[idx], self.y_cache[idx], self.w_cache[idx]
         return self._row_to_xy(idx)
 
 
@@ -163,17 +188,20 @@ def run_epoch(
 ) -> dict[str, float]:
     train_mode = optimizer is not None
     model.train(train_mode)
-    loss_fn = nn.SmoothL1Loss()
+    loss_fn = nn.SmoothL1Loss(reduction="none")
     target_mean, target_std = _target_tensors(target_stats, device)
     losses: list[float] = []
     sbps: list[float] = []
     dbps: list[float] = []
-    for x, y in loader:
+    for x, y, weight in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
+        weight = weight.to(device, non_blocking=True).view(-1, 1)
         with torch.set_grad_enabled(train_mode):
             pred = model(x)
-            loss = loss_fn(pred, y)
+            raw_loss = loss_fn(pred, y).mean(dim=1, keepdim=True)
+            denom = torch.clamp(weight.sum(), min=1e-6)
+            loss = (raw_loss * weight).sum() / denom
             if train_mode:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -240,9 +268,10 @@ def fit_one_fold(model_name: str, model_cfg: ModelConfig, train_df: pd.DataFrame
         if len(dp_ids) > 1:
             model = nn.DataParallel(model, device_ids=dp_ids)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(opt_cfg["learning_rate"]), weight_decay=float(opt_cfg["weight_decay"]))
+    metric_val_df = _measured_eval_df(val_df)
     train_loader, val_loader = build_loaders(
         train_df,
-        val_df,
+        metric_val_df,
         int(opt_cfg["batch_size"]),
         int(runtime_cfg["num_workers"]),
         model_cfg.input_channels,
@@ -260,6 +289,7 @@ def fit_one_fold(model_name: str, model_cfg: ModelConfig, train_df: pd.DataFrame
     history: list[dict[str, float]] = []
     print(
         f"[fold] model={model_name} train={len(train_df)} val={len(val_df)} "
+        f"metric_val={len(metric_val_df)} "
         f"batch={int(opt_cfg['batch_size'])} epochs={int(opt_cfg['epochs'])} "
         f"target_mean={target_stats['mean']} target_std={target_stats['std']}",
         flush=True,
@@ -302,6 +332,7 @@ def evaluate_model(
     target_stats: dict[str, list[float]],
 ) -> dict[str, float]:
     runtime_cfg = cfg["runtime"]
+    df = _measured_eval_df(df)
     loader = DataLoader(
         ScgDataset(
             df,
@@ -329,6 +360,7 @@ def predict_raw_model(
     target_stats: dict[str, list[float]],
 ) -> np.ndarray:
     runtime_cfg = cfg["runtime"]
+    df = _measured_eval_df(df)
     loader = DataLoader(
         ScgDataset(
             df,
@@ -356,6 +388,7 @@ def predict_raw_model(
 
 
 def _mae_np(pred: np.ndarray, df: pd.DataFrame) -> dict[str, float]:
+    df = _measured_eval_df(df)
     y = df[["SBP", "DBP"]].to_numpy(dtype=np.float32)
     err = np.abs(pred - y)
     return {
@@ -366,6 +399,7 @@ def _mae_np(pred: np.ndarray, df: pd.DataFrame) -> dict[str, float]:
 
 
 def _prediction_frame(df: pd.DataFrame, pred: np.ndarray) -> pd.DataFrame:
+    df = _measured_eval_df(df)
     out = df[["sample_id", "subject_id", "SBP", "DBP"]].copy()
     out["pred_SBP"] = pred[:, 0]
     out["pred_DBP"] = pred[:, 1]
@@ -426,23 +460,6 @@ def _write_history(path: Path, history: list[dict[str, float]]) -> None:
         writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
         writer.writeheader()
         writer.writerows(history)
-
-
-def _final_train_val_split(trainval: pd.DataFrame, folds: pd.DataFrame, validation_fold: int) -> tuple[pd.DataFrame, pd.DataFrame]:
-    fold_map = folds[folds["fold"] == validation_fold][["sample_id", "subset"]]
-    if fold_map.empty:
-        raise ValueError(f"final_validation_fold={validation_fold} not found in folds.csv")
-    merged = trainval.merge(fold_map, on="sample_id", how="inner")
-    tr_df = merged[merged["subset"] == "train"].drop(columns=["subset"])
-    va_df = merged[merged["subset"] == "val"].drop(columns=["subset"])
-    if tr_df.empty or va_df.empty:
-        raise RuntimeError(f"Invalid final validation fold {validation_fold}: train={len(tr_df)} val={len(va_df)}")
-    tr_subjects = set(tr_df["subject_id"].astype(str))
-    va_subjects = set(va_df["subject_id"].astype(str))
-    overlap = tr_subjects & va_subjects
-    if overlap:
-        raise RuntimeError(f"Subject leakage in final validation fold {validation_fold}: {sorted(overlap)}")
-    return tr_df, va_df
 
 
 def _assert_no_label_group_leakage(train_df: pd.DataFrame, val_df: pd.DataFrame, context: str) -> None:
@@ -606,7 +623,7 @@ def run(model_name: str, config_path: str, overrides: list[str] | None = None, f
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train one SCG-BP model variant.")
-    parser.add_argument("--model", required=True, choices=["full", "cnn_only", "lstm_only", "mlp_only"])
+    parser.add_argument("--model", required=True, choices=["full", "cnn_only", "lstm_only", "mlp_only", "tcn"])
     parser.add_argument("--config", required=True)
     parser.add_argument("--override", action="append", default=[])
     parser.add_argument("--fold", type=int, default=None, help="Run only one CV fold.")

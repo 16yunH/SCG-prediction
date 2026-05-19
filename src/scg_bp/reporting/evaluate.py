@@ -8,8 +8,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .config import load_with_overrides
-from .utils import ensure_dir
+from ..config import load_with_overrides
+from ..utils import ensure_dir
 
 
 def _load_metrics(path: Path) -> dict[str, Any]:

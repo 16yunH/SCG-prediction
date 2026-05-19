@@ -7,7 +7,7 @@ set -euo pipefail
 #   --gpu-mem-threshold 50 \
 #   --poll-seconds 60 \
 #   --session train_full \
-#   --command "python -m src.train --model full --config configs/train.yaml"
+#   --command "python -m src train --model full --config configs/train.yaml"
 
 GPU_UTIL_THRESHOLD=30
 GPU_MEM_THRESHOLD=50

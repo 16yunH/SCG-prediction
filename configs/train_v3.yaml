@@ -1,0 +1,36 @@
+input:
+  split_dir: ./artifacts/processed/v3/splits
+
+runtime:
+  device: cuda
+  seed: 42
+  num_workers: 4
+  pin_memory: true
+  cache_windows: true
+  mmap_arrays: true
+  allow_csv_fallback: false
+  use_data_parallel: false
+  gpu_ids: []
+
+optimization:
+  epochs: 200
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  early_stop_patience: 30
+  target_standardize: true
+  final_validation_fold: 1
+  allow_subject_overlap_validation: false
+  test_strategy: final
+
+model:
+  input_channels: 6
+  window_size: 1600
+  cnn_channels: [32, 64, 128]
+  lstm_hidden: 128
+  lstm_layers: 2
+  mlp_hidden: [128, 64]
+  dropout: 0.2
+
+output:
+  runs_dir: ./artifacts/runs_v3

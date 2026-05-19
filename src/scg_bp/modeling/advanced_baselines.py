@@ -20,8 +20,8 @@ from .baselines import (
     _write_predictions,
     _write_subject_errors,
 )
-from .config import load_with_overrides
-from .utils import ensure_dir, now_tag, save_json, set_seed
+from ..config import load_with_overrides
+from ..utils import ensure_dir, now_tag, save_json, set_seed
 
 
 def _build_models(cfg: dict[str, Any]) -> dict[str, Any]:

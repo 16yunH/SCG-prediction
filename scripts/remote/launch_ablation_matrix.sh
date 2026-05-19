@@ -100,7 +100,7 @@ run_task_cmd() {
     extra="--mode final"
   fi
   cat <<EOF
-python -u -m src.train --model ${model} --config configs/train.yaml ${extra} \
+python -u -m src train --model ${model} --config configs/train.yaml ${extra} \
   --override input.split_dir=${SPLIT_DIR} \
   --override output.runs_dir=${RUNS_DIR} \
   --override runtime.num_workers=${WORKERS} \

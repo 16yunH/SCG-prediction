@@ -6,7 +6,7 @@ from typing import Iterable
 
 import pandas as pd
 
-from .utils import parse_bp_time_token, pick_column
+from ..utils import parse_bp_time_token, pick_column
 
 
 BP_EXTENSIONS = {".csv", ".xlsx", ".xls"}

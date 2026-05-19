@@ -14,9 +14,9 @@ except Exception:  # noqa: BLE001
 
 import pandas as pd
 
-from .config import load_with_overrides
+from ..config import load_with_overrides
+from ..utils import ensure_dir
 from .report import _to_markdown_table
-from .utils import ensure_dir
 
 
 def _read_csv(path: str | Path) -> pd.DataFrame:

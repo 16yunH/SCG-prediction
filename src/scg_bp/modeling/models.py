@@ -120,12 +120,56 @@ class MlpOnlyModel(nn.Module):
         return self.head(flat)
 
 
+class TcnBlock(nn.Module):
+    def __init__(self, channels: int, dilation: int, dropout: float) -> None:
+        super().__init__()
+        padding = 2 * dilation
+        self.net = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=5, padding=padding, dilation=dilation),
+            nn.BatchNorm1d(channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Conv1d(channels, channels, kernel_size=5, padding=padding, dilation=dilation),
+            nn.BatchNorm1d(channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.net(x)
+        if y.shape[-1] != x.shape[-1]:
+            y = y[..., : x.shape[-1]]
+        return x + y
+
+
+class TcnModel(nn.Module):
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        hidden = cfg.cnn_channels[-1] if cfg.cnn_channels else 128
+        self.proj = nn.Conv1d(cfg.input_channels, hidden, kernel_size=1)
+        self.blocks = nn.Sequential(
+            TcnBlock(hidden, dilation=1, dropout=cfg.dropout),
+            TcnBlock(hidden, dilation=2, dropout=cfg.dropout),
+            TcnBlock(hidden, dilation=4, dropout=cfg.dropout),
+            TcnBlock(hidden, dilation=8, dropout=cfg.dropout),
+        )
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.head = MlpHead(hidden, cfg.mlp_hidden, cfg.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.proj(x)
+        z = self.blocks(z)
+        z = self.pool(z).squeeze(-1)
+        return self.head(z)
+
+
 def build_model(model_name: str, cfg: ModelConfig) -> nn.Module:
     table = {
         "full": FullModel,
         "cnn_only": CnnOnlyModel,
         "lstm_only": LstmOnlyModel,
         "mlp_only": MlpOnlyModel,
+        "tcn": TcnModel,
     }
     if model_name not in table:
         raise ValueError(f"Unknown model: {model_name}")

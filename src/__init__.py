@@ -1,1 +1,1 @@
-"""Public CLI package wrappers."""
+"""Repository-local CLI package."""

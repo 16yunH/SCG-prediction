@@ -6,8 +6,21 @@ from pathlib import Path
 
 import pandas as pd
 
-from .config import load_with_overrides
-from .utils import ensure_dir, save_json
+from ..config import load_with_overrides
+from ..utils import ensure_dir, save_json
+
+
+def _filter_supervised_samples(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    out = df.copy()
+    include_sources = cfg.get("input", {}).get("include_label_sources")
+    if include_sources and "label_source" in out.columns:
+        include = {str(x) for x in include_sources}
+        out = out[out["label_source"].astype(str).isin(include)]
+    elif "is_supervised" in out.columns:
+        out = out[out["is_supervised"].astype(str).str.lower().isin({"true", "1", "yes"})]
+    if {"SBP", "DBP"}.issubset(out.columns):
+        out = out.dropna(subset=["SBP", "DBP"])
+    return out.reset_index(drop=True)
 
 
 def _group_holdout(df: pd.DataFrame, test_size: float, seed: int) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -67,7 +80,7 @@ def _assert_no_leakage(trainval: pd.DataFrame, test: pd.DataFrame, folds: pd.Dat
 
 def run(config_path: str, overrides: list[str] | None = None) -> None:
     cfg = load_with_overrides(config_path, overrides)
-    sample_index = pd.read_csv(cfg["input"]["sample_index"])
+    sample_index = _filter_supervised_samples(pd.read_csv(cfg["input"]["sample_index"]), cfg)
     required = {"sample_id", "subject_id"}
     missing = required - set(sample_index.columns)
     if missing:

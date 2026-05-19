@@ -11,8 +11,8 @@ except Exception:  # noqa: BLE001
     _HAS_MPL = False
 import pandas as pd
 
-from .config import load_with_overrides
-from .utils import ensure_dir
+from ..config import load_with_overrides
+from ..utils import ensure_dir
 
 
 def _col(df: pd.DataFrame, preferred: str, fallback: str) -> str:

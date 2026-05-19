@@ -12,3 +12,4 @@ __all__ = [
     "report",
     "protocol_report",
 ]
+"""SCG blood pressure prediction package."""

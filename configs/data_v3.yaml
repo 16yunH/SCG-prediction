@@ -1,0 +1,47 @@
+paths:
+  data_root: ./data
+  artifacts_root: ./artifacts
+  processed_dir: ./artifacts/processed/v3
+  arrays_dir: ./artifacts/processed/v3/arrays
+  runs_dir: ./artifacts/runs_v3
+
+bp:
+  required_columns: [SBP, DBP]
+  optional_columns: [HR, PP]
+  strict: false
+
+scg:
+  preferred_axes_7col: [I1, I2, I3, I4, I5, I6]
+  preferred_axes_9col: [I3, I4, I5, I6, I7, I8]
+  sample_rate_hz: 50
+  input_channels: 6
+  materialize_arrays: true
+
+window:
+  seconds: 8
+  measured_seconds: [8, 16, 32]
+  measured_offsets_sec: [-60, -30, -20, -10, 0, 10, 20, 30, 60]
+  measured_label_weight: 1.0
+  alignment_method: bp_time_interpolation
+  stride_seconds: 2
+  jitter_steps: 0
+  interpolated:
+    enabled: true
+    stride_seconds: 30
+    exclude_margin_seconds: 30
+    max_gap_minutes: 20
+    label_weight: 0.2
+  unlabeled:
+    enabled: true
+    seconds: [32]
+    stride_seconds: 30
+
+output:
+  raw_manifest: ./artifacts/processed/v3/raw_manifest.csv
+  bp_index: ./artifacts/processed/v3/bp_index.csv
+  bp_corrections: ./artifacts/processed/v3/bp_corrections.csv
+  signal_index: ./artifacts/processed/v3/signal_index.csv
+  window_index: ./artifacts/processed/v3/window_index.csv
+  sample_index: ./artifacts/processed/v3/sample_index.csv
+  unlabeled_window_index: ./artifacts/processed/v3/unlabeled_window_index.csv
+  qc_report: ./artifacts/processed/v3/qc_report.json
